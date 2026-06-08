@@ -95,15 +95,31 @@ def test_setup_provider_choices_match_hermes_model_provider_rows():
 
     labels = [row[1] for row in build_provider_choices()]
 
-    assert labels == [
+    assert labels[:8] == [
         "OpenAI (API key)",
         "OpenAI Codex (OAuth / ChatGPT/Codex account)",
+        "OpenRouter (API key)",
+        "Anthropic (API key)",
         "Google Gemini (API key)",
         "Google Gemini OAuth / Code Assist",
         "xAI / Grok (API key)",
         "xAI Grok OAuth (SuperGrok / Premium+)",
-        "Leave unchanged",
     ]
+    for expected in [
+        "DeepSeek (API key)",
+        "Z.AI / GLM (API key)",
+        "Kimi / Moonshot (API key)",
+        "Alibaba / DashScope (API key)",
+        "MiniMax (API key)",
+        "Hugging Face (token)",
+        "NVIDIA NIM (API key)",
+        "Kilo Code (API key)",
+        "AI Gateway / Vercel (API key)",
+        "OpenCode Zen (API key)",
+        "LM Studio (local OpenAI-compatible)",
+        "Leave unchanged",
+    ]:
+        assert expected in labels
 
 
 def test_openai_models_include_gpt_55_first():
@@ -119,6 +135,10 @@ def test_setup_oauth_provider_slug_maps_without_separate_auth_picker():
     assert resolve_provider_selection("google-gemini-cli") == ("gemini", "oauth")
     assert resolve_provider_selection("xai-oauth") == ("grok", "oauth")
     assert resolve_provider_selection("openai-api") == ("openai", "api_key")
+    assert resolve_provider_selection("openrouter") == ("openrouter", "api_key")
+    assert resolve_provider_selection("anthropic") == ("anthropic", "api_key")
+    assert resolve_provider_selection("deepseek") == ("deepseek", "api_key")
+    assert resolve_provider_selection("moonshot") == ("kimi-coding", "api_key")
 
 
 def test_setup_picker_search_uses_hermes_fuzzy_subsequence_matching():
@@ -286,6 +306,15 @@ def test_provider_key_reads_oauth_access_token_and_env_override(monkeypatch):
     assert provider_key(config, "grok") == "stored-token"
     monkeypatch.setenv("AGC_GROK_OAUTH_TOKEN", "env-token")
     assert provider_key(config, "grok") == "env-token"
+
+
+def test_provider_key_reads_all_provider_env_aliases(monkeypatch):
+    from agentick.cli import provider_key
+
+    config = {"providers": {"anthropic": {"auth_method": "api_key", "api_key": "stored-key"}}}
+    assert provider_key(config, "anthropic") == "stored-key"
+    monkeypatch.setenv("ANTHROPIC_TOKEN", "anthropic-env-token")
+    assert provider_key(config, "anthropic") == "anthropic-env-token"
 
 
 def test_provider_readiness_requires_config_key_and_internet(monkeypatch):
@@ -607,6 +636,66 @@ def test_openai_chat_completions_omits_reasoning_for_gpt_4o_mini(monkeypatch):
             {"role": "system", "content": ""},
             {"role": "user", "content": "Hi"},
         ],
+    }
+
+
+def test_non_openai_provider_uses_openai_compatible_endpoint(monkeypatch):
+    from agentick import cli
+
+    captured: dict[str, object] = {}
+
+    def fake_urlopen_json(request, *, timeout: float = 120):
+        del timeout
+        captured["url"] = request.full_url
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["auth"] = request.headers.get("Authorization")
+        return {"choices": [{"message": {"content": "DS"}}], "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}}
+
+    monkeypatch.setattr(cli, "_urlopen_json", fake_urlopen_json)
+    response = cli.call_ai(
+        {"provider": "deepseek", "model": "deepseek-chat", "reasoning_effort": "medium", "user_prompt": "Hi"},
+        {"providers": {"deepseek": {"auth_method": "api_key", "api_key": "deep-key"}}},
+        "Hi",
+    )
+
+    assert response == "DS"
+    assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert captured["auth"] == "Bearer deep-key"
+    assert captured["payload"] == {
+        "model": "deepseek-chat",
+        "messages": [{"role": "system", "content": ""}, {"role": "user", "content": "Hi"}],
+    }
+
+
+def test_anthropic_provider_uses_messages_api(monkeypatch):
+    from agentick import cli
+
+    captured: dict[str, object] = {}
+
+    def fake_urlopen_json(request, *, timeout: float = 120):
+        del timeout
+        captured["url"] = request.full_url
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["api_key"] = request.headers.get("X-api-key")
+        captured["version"] = request.headers.get("Anthropic-version")
+        return {"content": [{"type": "text", "text": "CLAUDE"}], "usage": {"input_tokens": 4, "output_tokens": 2}}
+
+    monkeypatch.setattr(cli, "_urlopen_json", fake_urlopen_json)
+    response = cli.call_ai(
+        {"provider": "anthropic", "model": "claude-sonnet-4-6", "system_prompt": "Be terse", "user_prompt": "Hi"},
+        {"providers": {"anthropic": {"auth_method": "api_key", "api_key": "anthropic-key"}}},
+        "Hi",
+    )
+
+    assert response == "CLAUDE"
+    assert captured["url"] == "https://api.anthropic.com/v1/messages"
+    assert captured["api_key"] == "anthropic-key"
+    assert captured["version"] == "2023-06-01"
+    assert captured["payload"] == {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "system": "Be terse",
     }
 
 

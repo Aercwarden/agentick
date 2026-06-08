@@ -47,58 +47,287 @@ PROVIDERS: dict[str, dict[str, Any]] = {
     "openai": {
         "label": "OpenAI",
         "env": "OPENAI_API_KEY",
+        "env_vars": ["OPENAI_API_KEY"],
         "models": ["gpt-5.5", "gpt-5.5-mini", "gpt-5.4", "gpt-5.4-mini", "gpt-4o", "gpt-4o-mini"],
         "reasoning": ["minimal", "low", "medium", "high"],
         "url": "https://api.openai.com/v1/chat/completions",
+        "api": "openai",
         "auth_methods": ["api_key", "oauth"],
         "oauth_label": "OpenAI Codex OAuth (ChatGPT/Codex account)",
         "oauth_provider": "openai-codex",
         "oauth_env": "AGC_OPENAI_OAUTH_TOKEN",
     },
+    "openrouter": {
+        "label": "OpenRouter",
+        "env": "OPENROUTER_API_KEY",
+        "env_vars": ["OPENROUTER_API_KEY"],
+        "models": ["anthropic/claude-sonnet-4.6", "openai/gpt-5.5", "google/gemini-3-pro-preview", "x-ai/grok-4.3", "deepseek/deepseek-v4-pro"],
+        "reasoning": ["minimal", "low", "medium", "high"],
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "anthropic": {
+        "label": "Anthropic",
+        "env": "ANTHROPIC_API_KEY",
+        "env_vars": ["ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
+        "models": ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-sonnet-4-20250514"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://api.anthropic.com/v1/messages",
+        "api": "anthropic",
+        "auth_methods": ["api_key"],
+    },
     "gemini": {
         "label": "Gemini",
         "env": "GEMINI_API_KEY",
         "alt_env": "GOOGLE_API_KEY",
-        "models": ["gemini-3-flash-preview", "gemini-3-pro-preview", "gemini-2.5-flash"],
+        "env_vars": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "models": ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
         "reasoning": ["low", "medium", "high"],
         "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+        "api": "gemini",
         "auth_methods": ["api_key", "oauth"],
         "oauth_label": "Google Gemini OAuth (Gemini CLI / Cloud Code)",
         "oauth_provider": "google-gemini-cli",
         "oauth_env": "AGC_GEMINI_OAUTH_TOKEN",
     },
     "grok": {
-        "label": "Grok",
+        "label": "xAI / Grok",
         "env": "XAI_API_KEY",
+        "env_vars": ["XAI_API_KEY"],
         "models": ["grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning"],
         "reasoning": ["low", "medium", "high"],
         "url": "https://api.x.ai/v1/chat/completions",
+        "api": "openai",
         "auth_methods": ["api_key", "oauth"],
         "oauth_label": "xAI Grok OAuth (SuperGrok / Premium+)",
         "oauth_provider": "xai-oauth",
         "oauth_env": "AGC_GROK_OAUTH_TOKEN",
     },
+    "deepseek": {
+        "label": "DeepSeek",
+        "env": "DEEPSEEK_API_KEY",
+        "env_vars": ["DEEPSEEK_API_KEY"],
+        "models": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "zai": {
+        "label": "Z.AI / GLM",
+        "env": "GLM_API_KEY",
+        "env_vars": ["GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"],
+        "models": ["glm-5.1", "glm-5", "glm-5-turbo", "glm-4.5", "glm-4.5-flash"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://api.z.ai/api/paas/v4/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "kimi-coding": {
+        "label": "Kimi / Moonshot",
+        "env": "KIMI_API_KEY",
+        "env_vars": ["KIMI_API_KEY", "KIMI_CODING_API_KEY"],
+        "models": ["kimi-k2.6", "kimi-k2.5", "kimi-for-coding", "kimi-k2-thinking"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://api.moonshot.ai/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "alibaba": {
+        "label": "Alibaba / DashScope",
+        "env": "DASHSCOPE_API_KEY",
+        "env_vars": ["DASHSCOPE_API_KEY"],
+        "models": ["qwen3.7-max", "qwen3.6-plus", "qwen3.5-plus", "qwen3-coder-plus"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "minimax": {
+        "label": "MiniMax",
+        "env": "MINIMAX_API_KEY",
+        "env_vars": ["MINIMAX_API_KEY"],
+        "models": ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://api.minimax.io/v1/text/chatcompletion_v2",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "minimax-cn": {
+        "label": "MiniMax CN",
+        "env": "MINIMAX_CN_API_KEY",
+        "env_vars": ["MINIMAX_CN_API_KEY"],
+        "models": ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://api.minimaxi.com/v1/text/chatcompletion_v2",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "huggingface": {
+        "label": "Hugging Face",
+        "env": "HF_TOKEN",
+        "env_vars": ["HF_TOKEN"],
+        "models": ["moonshotai/Kimi-K2.5", "Qwen/Qwen3.5-397B-A17B", "deepseek-ai/DeepSeek-V3.2", "zai-org/GLM-5"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://router.huggingface.co/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "nvidia": {
+        "label": "NVIDIA NIM",
+        "env": "NVIDIA_API_KEY",
+        "env_vars": ["NVIDIA_API_KEY"],
+        "models": ["nvidia/nemotron-3-super-120b-a12b", "nvidia/nemotron-3-nano-30b-a3b", "openai/gpt-oss-120b"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "xiaomi": {
+        "label": "Xiaomi MiMo",
+        "env": "XIAOMI_API_KEY",
+        "env_vars": ["XIAOMI_API_KEY"],
+        "models": ["mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-flash"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://api.xiaomimimo.com/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "kilocode": {
+        "label": "Kilo Code",
+        "env": "KILOCODE_API_KEY",
+        "env_vars": ["KILOCODE_API_KEY"],
+        "models": ["anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://api.kilo.ai/api/gateway/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "ai-gateway": {
+        "label": "AI Gateway (Vercel)",
+        "env": "AI_GATEWAY_API_KEY",
+        "env_vars": ["AI_GATEWAY_API_KEY"],
+        "models": ["openai/gpt-5.4", "anthropic/claude-sonnet-4.6", "google/gemini-3-pro-preview"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://ai-gateway.vercel.sh/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "opencode-zen": {
+        "label": "OpenCode Zen",
+        "env": "OPENCODE_ZEN_API_KEY",
+        "env_vars": ["OPENCODE_ZEN_API_KEY"],
+        "models": ["kimi-k2.5", "gpt-5.4", "claude-sonnet-4.6", "gemini-3-pro"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://opencode.ai/zen/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "opencode-go": {
+        "label": "OpenCode Go",
+        "env": "OPENCODE_GO_API_KEY",
+        "env_vars": ["OPENCODE_GO_API_KEY"],
+        "models": ["kimi-k2.6", "glm-5.1", "mimo-v2.5-pro", "qwen3.7-max"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://opencode.ai/zen/go/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "lmstudio": {
+        "label": "LM Studio",
+        "env": "LM_API_KEY",
+        "env_vars": ["LM_API_KEY"],
+        "models": ["local-model"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "http://127.0.0.1:1234/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+        "allow_dummy_key": True,
+    },
+    "ollama-cloud": {
+        "label": "Ollama Cloud",
+        "env": "OLLAMA_API_KEY",
+        "env_vars": ["OLLAMA_API_KEY"],
+        "models": ["gpt-oss:120b", "llama3.3", "qwen3"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://ollama.com/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
+    "tencent-tokenhub": {
+        "label": "Tencent TokenHub",
+        "env": "TOKENHUB_API_KEY",
+        "env_vars": ["TOKENHUB_API_KEY"],
+        "models": ["hy3-preview"],
+        "reasoning": ["low", "medium", "high"],
+        "url": "https://tokenhub.tencentmaas.com/v1/chat/completions",
+        "api": "openai",
+        "auth_methods": ["api_key"],
+    },
 }
+
 
 SETUP_PROVIDER_ROWS: list[tuple[str, str, str, str]] = [
     ("openai-api", "OpenAI (API key)", "openai", "api_key"),
     ("openai-codex", "OpenAI Codex (OAuth / ChatGPT/Codex account)", "openai", "oauth"),
+    ("openrouter", "OpenRouter (API key)", "openrouter", "api_key"),
+    ("anthropic", "Anthropic (API key)", "anthropic", "api_key"),
     ("gemini", "Google Gemini (API key)", "gemini", "api_key"),
     ("google-gemini-cli", "Google Gemini OAuth / Code Assist", "gemini", "oauth"),
     ("xai", "xAI / Grok (API key)", "grok", "api_key"),
     ("xai-oauth", "xAI Grok OAuth (SuperGrok / Premium+)", "grok", "oauth"),
+    ("deepseek", "DeepSeek (API key)", "deepseek", "api_key"),
+    ("zai", "Z.AI / GLM (API key)", "zai", "api_key"),
+    ("kimi-coding", "Kimi / Moonshot (API key)", "kimi-coding", "api_key"),
+    ("alibaba", "Alibaba / DashScope (API key)", "alibaba", "api_key"),
+    ("minimax", "MiniMax (API key)", "minimax", "api_key"),
+    ("minimax-cn", "MiniMax CN (API key)", "minimax-cn", "api_key"),
+    ("huggingface", "Hugging Face (token)", "huggingface", "api_key"),
+    ("nvidia", "NVIDIA NIM (API key)", "nvidia", "api_key"),
+    ("xiaomi", "Xiaomi MiMo (API key)", "xiaomi", "api_key"),
+    ("kilocode", "Kilo Code (API key)", "kilocode", "api_key"),
+    ("ai-gateway", "AI Gateway / Vercel (API key)", "ai-gateway", "api_key"),
+    ("opencode-zen", "OpenCode Zen (API key)", "opencode-zen", "api_key"),
+    ("opencode-go", "OpenCode Go (API key)", "opencode-go", "api_key"),
+    ("lmstudio", "LM Studio (local OpenAI-compatible)", "lmstudio", "api_key"),
+    ("ollama-cloud", "Ollama Cloud (API key)", "ollama-cloud", "api_key"),
+    ("tencent-tokenhub", "Tencent TokenHub (API key)", "tencent-tokenhub", "api_key"),
     ("cancel", "Leave unchanged", "", ""),
 ]
+
 
 SETUP_PROVIDER_ALIASES = {
     "openai": "openai-api",
     "grok": "xai",
+    "xai-api": "xai",
+    "moonshot": "kimi-coding",
+    "kimi": "kimi-coding",
+    "dashscope": "alibaba",
+    "qwen": "alibaba",
+    "glm": "zai",
+    "vercel": "ai-gateway",
 }
+
 
 
 def build_provider_choices() -> list[tuple[str, str]]:
     """Return Hermes-style provider rows: concrete API-key/OAuth providers."""
     return [(slug, label) for slug, label, _provider, _auth in SETUP_PROVIDER_ROWS]
+
+
+def provider_env_names(provider: str) -> list[str]:
+    meta = PROVIDERS[provider]
+    names = [str(item) for item in meta.get("env_vars", []) if str(item)]
+    for key in ("env", "alt_env"):
+        value = str(meta.get(key, ""))
+        if value and value not in names:
+            names.append(value)
+    return names
+
+
+def provider_env_display(provider: str) -> str:
+    return " / ".join(provider_env_names(provider))
 
 
 def resolve_provider_selection(selection: str) -> tuple[str, str]:
@@ -168,9 +397,7 @@ def print_setup_guidance() -> None:
             continue
         provider, auth_method = resolve_provider_selection(slug)
         meta = PROVIDERS[provider]
-        envs = meta.get("env", "")
-        if meta.get("alt_env") and auth_method == "api_key":
-            envs += f" / {meta['alt_env']}"
+        envs = provider_env_display(provider)
         auth = "API key" if auth_method == "api_key" else f"OAuth ({meta['oauth_provider']})"
         print(f"  • {label} — {envs if auth_method == 'api_key' else auth}")
 
@@ -590,11 +817,13 @@ def setup_cmd(args: argparse.Namespace) -> int:
             "access_token": token,
         }
     else:
-        api_key = args.api_key or os.environ.get(meta["env"], "") or os.environ.get(meta.get("alt_env", ""), "")
+        api_key = args.api_key or next((os.environ.get(name, "") for name in provider_env_names(provider) if os.environ.get(name, "")), "")
+        if not api_key and meta.get("allow_dummy_key") and args.no_interactive:
+            api_key = "dummy-lm-api-key"
         if not api_key and not args.no_interactive and sys.stdin.isatty():
-            api_key = getpass.getpass(f"{meta['label']} API key ({meta['env']}): ").strip()
+            api_key = getpass.getpass(f"{meta['label']} API key ({provider_env_display(provider)}): ").strip()
         if not api_key:
-            print(f"Missing API key. Set {meta['env']} or pass --api-key.", file=sys.stderr)
+            print(f"Missing API key. Set {provider_env_display(provider)} or pass --api-key.", file=sys.stderr)
             return 2
         secret_fields = {"auth_method": "api_key", "api_key": api_key}
     config = load_config() or {"providers": {}}
@@ -1261,9 +1490,13 @@ def render_prompt(template: str, argv: list[str]) -> str:
 def provider_key(config: dict[str, Any], provider: str) -> str:
     provider_cfg = ((config.get("providers") or {}).get(provider) or {})
     saved = provider_cfg.get("access_token", "") if provider_cfg.get("auth_method") == "oauth" else provider_cfg.get("api_key", "")
-    env_key = PROVIDERS[provider]["env"]
     oauth_env = PROVIDERS[provider].get("oauth_env", "") if provider_cfg.get("auth_method") == "oauth" else ""
-    return os.environ.get(oauth_env) or os.environ.get(env_key) or os.environ.get(PROVIDERS[provider].get("alt_env", ""), "") or saved
+    if oauth_env and os.environ.get(oauth_env):
+        return os.environ[oauth_env]
+    for env_name in provider_env_names(provider):
+        if os.environ.get(env_name):
+            return os.environ[env_name]
+    return saved
 
 
 def provider_config(config: dict[str, Any], provider: str) -> dict[str, Any]:
@@ -1437,6 +1670,45 @@ def supports_reasoning_effort(provider: str, model: str) -> bool:
     return normalized.startswith(("o1", "o3", "o4", "gpt-5"))
 
 
+def is_openai_compatible(provider: str) -> bool:
+    return str(PROVIDERS[provider].get("api") or "openai") == "openai"
+
+
+def anthropic_headers(config: dict[str, Any], provider: str) -> dict[str, str]:
+    key = provider_key(config, provider)
+    if provider == "anthropic":
+        return {
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+    return {
+        "Authorization": f"Bearer {key}",
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+
+
+def extract_anthropic_text(data: dict[str, Any]) -> str:
+    parts = data.get("content")
+    if isinstance(parts, list):
+        texts = [str(part.get("text", "")) for part in parts if isinstance(part, dict) and part.get("type") in {"text", None}]
+        if texts:
+            return "".join(texts)
+    return str(data.get("text") or "")
+
+
+def normalize_anthropic_usage(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    input_tokens = usage_number(raw.get("input_tokens"))
+    output_tokens = usage_number(raw.get("output_tokens"))
+    result = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    if input_tokens is not None and output_tokens is not None:
+        result["total_tokens"] = input_tokens + output_tokens
+    return {key: value for key, value in result.items() if value is not None}
+
+
 def call_openai_compatible(provider: str, task: dict[str, Any], config: dict[str, Any], prompt: str) -> str:
     meta = PROVIDERS[provider]
     model = resolved_model(task, config, provider)
@@ -1459,6 +1731,28 @@ def call_openai_compatible(provider: str, task: dict[str, Any], config: dict[str
     data = _urlopen_json(request, timeout=120)
     record_ai_usage(provider, model, reasoning, normalize_openai_usage(data.get("usage")))
     return data["choices"][0]["message"]["content"]
+
+
+def call_anthropic(provider: str, task: dict[str, Any], config: dict[str, Any], prompt: str) -> str:
+    meta = PROVIDERS[provider]
+    model = resolved_model(task, config, provider)
+    payload: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if task.get("system_prompt"):
+        payload["system"] = str(task.get("system_prompt", ""))
+    request = urllib.request.Request(
+        meta["url"],
+        data=json.dumps(payload).encode(),
+        headers=anthropic_headers(config, provider),
+        method="POST",
+    )
+    data = _urlopen_json(request, timeout=120)
+    reasoning = resolved_reasoning_effort(task, config, provider)
+    record_ai_usage(provider, model, reasoning, normalize_anthropic_usage(data.get("usage")))
+    return extract_anthropic_text(data)
 
 
 def http_error_detail(exc: urllib.error.HTTPError) -> str:
@@ -1513,10 +1807,12 @@ def call_ai(task: dict[str, Any], config: dict[str, Any], prompt: str) -> str:
         provider_cfg = provider_config(config, provider)
         if provider_cfg.get("auth_method") == "oauth":
             raise RuntimeError(f"Missing OAuth token for {provider}. Run agc setup or set {PROVIDERS[provider]['oauth_env']}.")
-        raise RuntimeError(f"Missing API key for {provider}. Run agc setup or set {PROVIDERS[provider]['env']}.")
+        raise RuntimeError(f"Missing API key for {provider}. Run agc setup or set {provider_env_display(provider)}.")
     if provider == "gemini":
         return call_gemini(task, config, prompt)
-    if provider in {"openai", "grok"}:
+    if str(PROVIDERS[provider].get("api")) == "anthropic":
+        return call_anthropic(provider, task, config, prompt)
+    if is_openai_compatible(provider):
         return call_openai_compatible(provider, task, config, prompt)
     raise RuntimeError(f"Unsupported provider: {provider}")
 
@@ -1585,7 +1881,20 @@ def call_ai_messages(task: dict[str, Any], config: dict[str, Any], messages: lis
     if provider == "gemini":
         prompt = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
         return call_gemini({**task, "system_prompt": ""}, config, prompt)
-    if provider in {"openai", "grok"}:
+    if str(PROVIDERS[provider].get("api")) == "anthropic":
+        system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
+        anthropic_messages = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages if m.get("role") != "system"]
+        meta = PROVIDERS[provider]
+        model = resolved_model(task, config, provider)
+        payload: dict[str, Any] = {"model": model, "max_tokens": 4096, "messages": anthropic_messages or [{"role": "user", "content": ""}]}
+        if system:
+            payload["system"] = system
+        reasoning = resolved_reasoning_effort(task, config, provider)
+        request = urllib.request.Request(meta["url"], data=json.dumps(payload).encode(), headers=anthropic_headers(config, provider), method="POST")
+        data = _urlopen_json(request, timeout=120)
+        record_ai_usage(provider, model, reasoning, normalize_anthropic_usage(data.get("usage")))
+        return extract_anthropic_text(data)
+    if is_openai_compatible(provider):
         meta = PROVIDERS[provider]
         model = resolved_model(task, config, provider)
         payload: dict[str, Any] = {"model": model, "messages": messages}
@@ -2628,7 +2937,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-commit", action="store_true", help="allow agentic tasks to create git commits")
     sub = parser.add_subparsers(dest="command")
 
-    setup = sub.add_parser("setup", help="configure OpenAI, Gemini, or Grok")
+    setup = sub.add_parser("setup", help="configure an AI provider")
     setup.add_argument("--provider", choices=sorted({slug for slug, _label in build_provider_choices()} | set(PROVIDERS) | {"xai"}))
     setup.add_argument("--model")
     setup.add_argument("--reasoning")

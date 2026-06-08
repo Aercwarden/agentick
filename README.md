@@ -43,7 +43,9 @@ The flow is deliberately simple:
 
 ```text
 1. agc setup
-   Configure one working AI provider: OpenAI, Gemini, or xAI/Grok.
+   Configure one working AI provider: OpenAI, OpenRouter, Anthropic, Gemini,
+   xAI/Grok, DeepSeek, Kimi, DashScope/Qwen, MiniMax, Hugging Face, NVIDIA,
+   or another OpenAI-compatible provider.
 
 2. agc new ./prompt.md review
    Save a reusable prompt task under ~/.agentick/tasks/review.json.
@@ -142,7 +144,10 @@ needs.
 
 ## Highlights
 
-- `agc setup` for OpenAI, Gemini, and xAI/Grok.
+- `agc setup` for OpenAI, OpenRouter, Anthropic, Gemini, xAI/Grok, DeepSeek,
+  Z.AI/GLM, Kimi/Moonshot, Alibaba/DashScope, MiniMax, Hugging Face, NVIDIA,
+  Xiaomi MiMo, Kilo Code, AI Gateway, OpenCode, LM Studio, Ollama Cloud, and
+  Tencent TokenHub.
 - API-key and supported OAuth/device-code setup paths.
 - Strict readiness gate: non-setup commands refuse to run until a provider,
   credentials, and internet connectivity are present.
@@ -174,10 +179,14 @@ terminal/font you use; Agentick does not require or inject a custom font.
 
 - Python 3.11+
 - Internet access for AI provider calls
-- At least one provider credential:
+- At least one provider credential. Common options:
   - `OPENAI_API_KEY`
+  - `OPENROUTER_API_KEY`
+  - `ANTHROPIC_API_KEY` (also checks `ANTHROPIC_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN`)
   - `GEMINI_API_KEY` or `GOOGLE_API_KEY`
   - `XAI_API_KEY`
+  - `DEEPSEEK_API_KEY`
+  - `GLM_API_KEY`, `KIMI_API_KEY`, `DASHSCOPE_API_KEY`, `MINIMAX_API_KEY`, `HF_TOKEN`, `NVIDIA_API_KEY`, or another provider key shown by `agc setup`
   - or an OAuth/device-code path exposed by `agc setup`
 
 ## Installation
@@ -271,9 +280,18 @@ Non-interactive API-key examples:
 
 ```bash
 OPENAI_API_KEY="..." agc setup --provider openai --model gpt-4o-mini --reasoning minimal --no-interactive
+OPENROUTER_API_KEY="..." agc setup --provider openrouter --model anthropic/claude-sonnet-4.6 --reasoning medium --no-interactive
+ANTHROPIC_API_KEY="..." agc setup --provider anthropic --model claude-sonnet-4-6 --reasoning medium --no-interactive
 GEMINI_API_KEY="..." agc setup --provider gemini --model gemini-3-flash-preview --reasoning medium --no-interactive
 XAI_API_KEY="..." agc setup --provider xai --model grok-4.3 --reasoning medium --no-interactive
+DEEPSEEK_API_KEY="..." agc setup --provider deepseek --model deepseek-chat --reasoning medium --no-interactive
 ```
+
+The interactive picker also lists Z.AI/GLM, Kimi/Moonshot, Alibaba/DashScope,
+MiniMax, Hugging Face, NVIDIA NIM, Xiaomi MiMo, Kilo Code, AI Gateway, OpenCode,
+LM Studio, Ollama Cloud, and Tencent TokenHub. Most of these use
+OpenAI-compatible `/chat/completions`; Anthropic uses the native Messages API;
+Gemini uses Google `generateContent`.
 
 OpenAI OAuth/device-code setup is also available from the interactive setup
 picker. Agentick opens your browser or shows a device code; you do not need to
