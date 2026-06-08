@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="620" viewBox="0 0 960 620" role="img" aria-label="Agentick response viewer terminal screenshot">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#07111f"/>
+      <stop offset="1" stop-color="#180923"/>
+    </linearGradient>
+  </defs>
+  <rect width="960" height="620" fill="#05070d"/>
+  <rect x="40" y="36" width="880" height="548" rx="18" fill="url(#bg)" stroke="#2a3358"/>
+  <circle cx="72" cy="68" r="7" fill="#ff5f57"/>
+  <circle cx="96" cy="68" r="7" fill="#ffbd2e"/>
+  <circle cx="120" cy="68" r="7" fill="#28c840"/>
+  <text x="150" y="73" fill="#7dd3fc" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="15">agentick - rich response viewer</text>
+  <g font-family="ui-monospace, Menlo, Consolas, monospace" font-size="17" font-variant-ligatures="none">
+    <text x="72" y="118" fill="#d1d5db">$ agc review ./src/agentick/cli.py:L850..L920</text>
+    <text x="72" y="154" fill="#22d3ee">✓ Running review... 4s</text>
+    <text x="72" y="205" fill="#f472b6" font-size="24" font-weight="700">Code Review</text>
+    <text x="72" y="246" fill="#e5e7eb">The slice is cleanly organized. A couple of runtime details matter:</text>
+    <text x="92" y="286" fill="#a7f3d0">•</text><text x="122" y="286" fill="#e5e7eb">Provider-specific parameters should stay model-aware.</text>
+    <text x="92" y="318" fill="#a7f3d0">•</text><text x="122" y="318" fill="#e5e7eb">HTTP errors should include provider response bodies.</text>
+
+    <rect x="72" y="350" width="500" height="130" rx="8" fill="#0b1220" stroke="#334155"/>
+    <g font-size="15">
+      <text x="92" y="382" fill="#94a3b8">python</text>
+      <text x="92" y="414" fill="#fbbf24">if</text><text x="118" y="414" fill="#e5e7eb"> reasoning and supports_reasoning(</text>
+      <text x="118" y="444" fill="#e5e7eb">        provider, model):</text>
+      <text x="118" y="474" fill="#38bdf8">payload</text><text x="178" y="474" fill="#e5e7eb">[</text><text x="190" y="474" fill="#a7f3d0">"reasoning"</text><text x="292" y="474" fill="#e5e7eb">] = reasoning</text>
+    </g>
+
+    <rect x="610" y="350" width="230" height="130" rx="8" fill="#101827" stroke="#334155"/>
+    <text x="632" y="384" fill="#f472b6">Area</text><text x="740" y="384" fill="#f472b6">Status</text>
+    <line x1="632" y1="398" x2="820" y2="398" stroke="#334155"/>
+    <text x="632" y="430" fill="#e5e7eb">API args</text><text x="740" y="430" fill="#34d399">OK</text>
+    <text x="632" y="460" fill="#e5e7eb">Errors</text><text x="740" y="460" fill="#34d399">OK</text>
+
+    <text x="72" y="538" fill="#94a3b8">h/k/↑ up · j/↓ down · Space/PgDn · b/PgUp · g/G · q quit · 1-18/42</text>
+  </g>
+</svg>

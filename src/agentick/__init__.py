@@ -1,0 +1,3 @@
+"""Agentick: reusable AI prompt CLI."""
+
+__version__ = "0.1.0"
