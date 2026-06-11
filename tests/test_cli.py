@@ -937,6 +937,62 @@ def test_reply_mode_slash_commands_cancel_or_open_visual():
     assert cli.complete_reply_command("/e") == "/exit"
     assert cli.complete_reply_command("/v") == "/visual"
     assert cli.complete_reply_command("/unknown") == "/unknown"
+    assert cli._reply_command_completer("/e", 0) == "/exit "
+    assert cli._reply_command_completer("/e", 1) is None
+    hint = cli.strip_ansi(cli.reply_mode_hint())
+    assert "arrows move cursor" in hint
+    assert "Tab completes slash commands" in hint
+
+
+def test_reply_prompt_uses_terminal_line_editor_for_arrow_cursor_editing():
+    if os.name == "nt":
+        return
+    import pty
+    import select
+    import signal
+    import time
+
+    code = (
+        "import sys; sys.path.insert(0, 'src'); "
+        "from agentick.cli import _prompt_line; "
+        "reply = _prompt_line('Reply: ', previous_response='previous'); "
+        "print('RESULT:' + reply)"
+    )
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+    )
+    os.close(slave)
+    output = b""
+    sent = False
+    deadline = time.time() + 8
+    try:
+        while time.time() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.1)
+            if readable:
+                chunk = os.read(master, 4096)
+                if not chunk:
+                    break
+                output += chunk
+                if b"Reply: " in output and not sent:
+                    # abc, left, left, X, enter => aXbc only if cursor movement works.
+                    os.write(master, b"abc\x1b[D\x1b[DX\r")
+                    sent = True
+            if proc.poll() is not None:
+                break
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=2)
+    finally:
+        os.close(master)
+
+    assert sent
+    assert proc.returncode == 0
+    assert b"RESULT:aXbc" in output
 
 
 def test_conversation_footer_shows_top_hotkeys_and_overlay_lists_all_keys(monkeypatch):

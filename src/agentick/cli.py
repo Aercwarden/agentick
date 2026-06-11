@@ -2803,67 +2803,72 @@ def resolve_reply_command(text: str) -> str | None:
     return None
 
 
+def _reply_command_completer(text: str, state: int) -> str | None:
+    """Readline completer for reply-mode slash commands."""
+    matches = [command + " " for command, _description in REPLY_COMMANDS if command.startswith(text)]
+    if state < len(matches):
+        return matches[state]
+    return None
+
+
+class _ReplyReadlineSession:
+    def __enter__(self) -> Any:
+        try:
+            import readline
+        except ImportError:
+            self.readline = None
+            return None
+        self.readline = readline
+        self.previous_completer = readline.get_completer()
+        self.previous_delims = readline.get_completer_delims()
+        readline.set_completer_delims(" \t\n")
+        readline.set_completer(_reply_command_completer)
+        # GNU readline uses this form; macOS commonly uses libedit and accepts
+        # the second binding. Keep both so Tab completes slash commands without
+        # breaking normal arrow/Home/End editing.
+        readline.parse_and_bind("tab: complete")
+        readline.parse_and_bind("bind ^I rl_complete")
+        return readline
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.readline is None:
+            return
+        self.readline.set_completer(self.previous_completer)
+        self.readline.set_completer_delims(self.previous_delims)
+
+
+def reply_mode_hint() -> str:
+    return f"{DIM}/exit cancel · /visual editor · Tab completes slash commands · arrows move cursor{RESET}"
+
+
+def _read_interactive_line(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("\n")
+        return ""
+
+
 def _prompt_line(prompt: str, *, previous_response: str | None = None, old_settings: list[Any] | None = None) -> str:
     fd = sys.stdin.fileno()
-    if previous_response is None:
-        if old_settings is not None:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        try:
-            sys.stdout.write("\x1b[?25h\n" + prompt)
-            sys.stdout.flush()
-            line = sys.stdin.readline()
-            return line.rstrip("\n")
-        finally:
-            if old_settings is not None:
-                tty.setcbreak(fd)
-
-    buffer = ""
-
-    def reply_preview(text: str) -> str:
-        if text.startswith("/"):
-            return render_reply_command_suggestions(text)
-        ranges = parse_cite_ranges(text)
-        if not ranges:
-            return f"{DIM}/exit cancel · /visual editor · Tab autocomplete{RESET}"
-        try:
-            chunk = extract_citation_chunk(previous_response, ranges[-1])
-        except ValueError as exc:
-            return f"{RED}{exc}{RESET}"
-        one_line = chunk.replace("\n", " ↵ ")
-        if len(one_line) > 100:
-            one_line = one_line[:97] + "..."
-        return f"{GREEN}citing:{RESET} {BOLD}{one_line}{RESET}"
-
+    if old_settings is not None:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     try:
-        tty.setcbreak(fd)
         sys.stdout.write("\x1b[?25h\n")
-        while True:
-            preview = reply_preview(buffer)
-            sys.stdout.write("\r\x1b[2K" + prompt + buffer)
-            sys.stdout.write("\x1b[K")
-            if preview:
-                sys.stdout.write("\n\r\x1b[2K" + preview + "\x1b[A")
+        if previous_response is not None:
+            sys.stdout.write(reply_mode_hint() + "\n")
             sys.stdout.flush()
-            ch = sys.stdin.read(1)
-            if ch in {"\r", "\n"}:
-                sys.stdout.write("\n")
-                command_result = resolve_reply_command(buffer)
-                if command_result is not None:
-                    return command_result
-                return buffer
-            if ch == "\x03":
-                return ""
-            if ch == "\t":
-                buffer = complete_reply_command(buffer)
-                continue
-            if ch in {"\x7f", "\b"}:
-                buffer = buffer[:-1]
-                continue
-            if ch >= " ":
-                buffer += ch
+            with _ReplyReadlineSession():
+                line = _read_interactive_line(prompt)
+        else:
+            sys.stdout.flush()
+            line = sys.stdin.readline().rstrip("\n")
+        command_result = resolve_reply_command(line) if previous_response is not None else None
+        if command_result is not None:
+            return command_result
+        return line
     finally:
         if old_settings is not None:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             tty.setcbreak(fd)
 
 

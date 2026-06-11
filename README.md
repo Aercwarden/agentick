@@ -558,8 +558,9 @@ keeps only the top hotkeys visible (`R` reply, `C` compact context, `q` quit) pl
 `?` for a full hotkey overlay; press `?` or `q` inside that overlay to close it
 and resume. `E`/`V` opens `$VISUAL`, `$EDITOR`, or `vim` for a multiline reply.
 Inside the quick `R` reply prompt, type `/exit` to cancel back to the viewer or
-`/visual` to switch into the editor; typing `/` shows those commands and `Tab`
-autocompletes them. In non-TTY shells or scripts, pass `--reply` for a one-shot resume or
+`/visual` to switch into the editor. The prompt uses the terminal line editor, so
+arrow keys, Home/End, Ctrl-A/Ctrl-E, backspace/delete, and normal cursor movement
+work like other modern CLI chat tools; `Tab` completes slash commands. In non-TTY shells or scripts, pass `--reply` for a one-shot resume or
 `--edit-reply` to compose the reply in your editor; use `--headless` for raw
 stdout suitable for redirection.
 
