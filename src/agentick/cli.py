@@ -410,11 +410,15 @@ def usage_after_setup() -> str:
       agc edit <task-name>          # edit an existing task
       agc delete <task-name>        # delete a saved task
       agc tasks                     # list saved tasks
+      agc chats                     # list saved chat sessions
+      agc chats reset <task> --yes   # reset saved chat context
       agc <task-name> [args...]     # run a saved task
+      agc <task-name> --no-context  # run without saving chat context
       agc routines create <task-name> --every 1h
       agc routines                  # list routine tasks
       agc routines stop <task-name>
       agc routines delete <task-name> --yes
+      agc clean                     # remove local data but keep provider credentials
 
     Prompt files: .txt, .md, .yaml, .json
     Task vault: ~/.agentick/tasks (or AGENTICK_HOME/tasks)
@@ -423,6 +427,16 @@ def usage_after_setup() -> str:
 
 def strip_ansi(text: str) -> str:
     return re.sub(r"\033\[[0-9;]*m", "", text)
+
+
+def rstrip_ansi_padded_line(line: str) -> str:
+    match = re.search(r"((?:[ \t]|\033\[[0-9;]*m)+)$", line.rstrip())
+    if not match:
+        return line.rstrip()
+    stripped = line[: match.start()]
+    if "\033[" in stripped:
+        return stripped + RESET
+    return stripped
 
 
 def render_choice_menu(
@@ -644,6 +658,26 @@ def _urlopen_json(request: urllib.request.Request, *, timeout: float = 15.0) -> 
     context = ssl.create_default_context(cafile=certifi.where())
     with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _urlopen_sse_events(request: urllib.request.Request, *, timeout: float = 120.0) -> list[dict[str, Any]]:
+    context = ssl.create_default_context(cafile=certifi.where())
+    events: list[dict[str, Any]] = []
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+    return events
 
 
 def _json_post(url: str, payload: dict[str, Any], *, form: bool = False, timeout: float = 15.0) -> dict[str, Any]:
@@ -1489,10 +1523,16 @@ def render_prompt(template: str, argv: list[str]) -> str:
 
 def provider_key(config: dict[str, Any], provider: str) -> str:
     provider_cfg = ((config.get("providers") or {}).get(provider) or {})
-    saved = provider_cfg.get("access_token", "") if provider_cfg.get("auth_method") == "oauth" else provider_cfg.get("api_key", "")
-    oauth_env = PROVIDERS[provider].get("oauth_env", "") if provider_cfg.get("auth_method") == "oauth" else ""
-    if oauth_env and os.environ.get(oauth_env):
-        return os.environ[oauth_env]
+    if provider_cfg.get("auth_method") == "oauth":
+        oauth_env = str(PROVIDERS[provider].get("oauth_env", ""))
+        if oauth_env and os.environ.get(oauth_env):
+            return os.environ[oauth_env]
+        # OAuth access tokens are not interchangeable with provider API keys.
+        # In particular, OPENAI_API_KEY=test-key must not override a saved
+        # OpenAI Codex OAuth token, or setup succeeds and later calls fail with
+        # a misleading "Incorrect API key" response.
+        return str(provider_cfg.get("access_token", ""))
+    saved = provider_cfg.get("api_key", "")
     for env_name in provider_env_names(provider):
         if os.environ.get(env_name):
             return os.environ[env_name]
@@ -1661,6 +1701,97 @@ def format_usage_log(events: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def estimate_text_tokens(text: str) -> int:
+    # Cheap, local estimate for preflight context display. Providers return exact
+    # token usage only after a request; this keeps the viewer useful before send.
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def estimate_messages_tokens(messages: list[dict[str, str]]) -> int:
+    total = 0
+    for message in messages:
+        total += 4  # lightweight role/message overhead approximation
+        total += estimate_text_tokens(str(message.get("role", "")))
+        total += estimate_text_tokens(str(message.get("content", "")))
+    return total
+
+
+def model_context_window(provider: str, model: str) -> int | None:
+    override = os.environ.get("AGC_CONTEXT_LIMIT_TOKENS")
+    if override:
+        try:
+            value = int(override)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    normalized = model.lower()
+    if "gpt-4o" in normalized or normalized.startswith(("gpt-5", "o1", "o3", "o4")):
+        return 128_000
+    if "claude" in normalized:
+        return 200_000
+    if "gemini" in normalized:
+        return 1_000_000 if "flash" not in normalized else 128_000
+    if "grok" in normalized:
+        return 256_000
+    if "deepseek" in normalized or "qwen" in normalized or "glm" in normalized or "kimi" in normalized:
+        return 128_000
+    if "mistral" in normalized or "llama" in normalized or "nemotron" in normalized:
+        return 128_000
+    if provider in {"openrouter", "kilocode", "ai-gateway", "opencode-zen", "opencode-go"}:
+        return None
+    return 128_000
+
+
+def context_usage(messages: list[dict[str, str]], provider: str, model: str) -> dict[str, Any]:
+    estimated = estimate_messages_tokens(messages)
+    limit = model_context_window(provider, model)
+    percent = (estimated / limit * 100.0) if limit else None
+    return {"estimated_tokens": estimated, "limit_tokens": limit, "percent": percent}
+
+
+def format_context_status(messages: list[dict[str, str]], provider: str, model: str, *, color: bool = False) -> str:
+    usage = context_usage(messages, provider, model)
+    estimated = int(usage["estimated_tokens"])
+    limit = usage.get("limit_tokens")
+    percent = usage.get("percent")
+    warning = ""
+    if isinstance(percent, float) and percent >= 50.0:
+        warning = " ⚠ compact soon"
+    if limit:
+        text = f"Context ~{estimated:,}/{int(limit):,} tokens ({percent:.0f}%){warning}"
+    else:
+        text = f"Context ~{estimated:,} tokens (limit unknown){warning}"
+    if color and warning:
+        return f"{YELLOW}{text}{RESET}"
+    return text
+
+
+def format_context_report(task_name: str, session_id: str, messages: list[dict[str, str]], provider: str, model: str) -> str:
+    usage = context_usage(messages, provider, model)
+    limit = usage.get("limit_tokens")
+    percent = usage.get("percent")
+    lines = [
+        f"# Agentick chat context: {task_name}",
+        "",
+        f"Session id: `{session_id}`",
+        "",
+        f"Provider: `{provider}`",
+        f"Model: `{model}`",
+        f"Estimated input context tokens: {int(usage['estimated_tokens']):,}",
+    ]
+    if limit:
+        lines.extend([f"Estimated model context window: {int(limit):,}", f"Estimated context used: {percent:.1f}%"])
+        if isinstance(percent, float) and percent >= 50.0:
+            lines.append("Warning: context is at or above 50%; compact soon with `agc chats compact <task> <session-id>`.")
+    else:
+        lines.append("Estimated model context window: unknown for this routed model/provider.")
+    lines.extend(["", "Note: this is a local preflight estimate. Provider-reported usage in `agc history view` is exact after a call when the provider reports tokens.", ""])
+    return "\n".join(lines)
+
+
 def supports_reasoning_effort(provider: str, model: str) -> bool:
     if provider == "grok":
         return True
@@ -1668,6 +1799,133 @@ def supports_reasoning_effort(provider: str, model: str) -> bool:
         return False
     normalized = model.lower()
     return normalized.startswith(("o1", "o3", "o4", "gpt-5"))
+
+
+def provider_auth_method(config: dict[str, Any], provider: str) -> str:
+    return str(provider_config(config, provider).get("auth_method") or "api_key")
+
+
+def openai_codex_headers(config: dict[str, Any]) -> dict[str, str]:
+    token = provider_key(config, "openai")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "codex_cli_rs/0.0.0 (Agentick)",
+        "originator": "codex_cli_rs",
+    }
+    try:
+        import base64
+
+        parts = token.split(".")
+        if len(parts) >= 2:
+            payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+            account_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+            if isinstance(account_id, str) and account_id:
+                headers["ChatGPT-Account-ID"] = account_id
+    except Exception:
+        pass
+    return headers
+
+
+def messages_to_codex_responses_payload(messages: list[dict[str, str]], model: str, reasoning: str) -> dict[str, Any]:
+    instructions = "You are a helpful assistant."
+    input_messages: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        content = str(message.get("content") or "")
+        if role == "system":
+            instructions = content or instructions
+        else:
+            input_messages.append({"role": role, "content": content})
+    payload: dict[str, Any] = {
+        "model": model,
+        "instructions": instructions,
+        "input": input_messages or [{"role": "user", "content": ""}],
+        "store": False,
+    }
+    if reasoning:
+        payload["reasoning"] = {"effort": "low" if reasoning == "minimal" else reasoning, "summary": "auto"}
+        payload["include"] = ["reasoning.encrypted_content"]
+    return payload
+
+
+def extract_responses_text(data: dict[str, Any]) -> str:
+    if isinstance(data.get("output_text"), str):
+        return data["output_text"]
+    parts: list[str] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
+def normalize_responses_usage(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    input_tokens = usage_number(raw.get("input_tokens"))
+    output_tokens = usage_number(raw.get("output_tokens"))
+    total_tokens = usage_number(raw.get("total_tokens"))
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    return {key: value for key, value in {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens}.items() if value is not None}
+
+
+def consume_codex_sse_events(events: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    delta_parts: list[str] = []
+    item_parts: list[str] = []
+    usage: dict[str, Any] = {}
+    for event in events:
+        event_type = str(event.get("type") or "")
+        if event_type == "error":
+            message = event.get("message") or event.get("code") or "Codex OAuth stream returned an error event."
+            raise RuntimeError(str(message))
+        if event_type == "response.output_text.delta" or "output_text.delta" in event_type:
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                delta_parts.append(delta)
+            continue
+        if event_type == "response.output_item.done":
+            item = event.get("item")
+            if isinstance(item, dict):
+                for content in item.get("content") or []:
+                    if isinstance(content, dict) and isinstance(content.get("text"), str):
+                        item_parts.append(content["text"])
+            continue
+        if event_type in {"response.completed", "response.incomplete", "response.failed"}:
+            response = event.get("response")
+            if isinstance(response, dict):
+                usage = normalize_responses_usage(response.get("usage"))
+                if event_type == "response.failed":
+                    error = response.get("error")
+                    raise RuntimeError(json.dumps(error) if isinstance(error, dict) else str(error or "Codex OAuth response failed."))
+    return "".join(delta_parts or item_parts), usage
+
+
+def call_openai_codex_oauth(task: dict[str, Any], config: dict[str, Any], messages: list[dict[str, str]]) -> str:
+    model = resolved_model(task, config, "openai")
+    reasoning = resolved_reasoning_effort(task, config, "openai")
+    payload = messages_to_codex_responses_payload(messages, model, reasoning)
+    payload["stream"] = True
+    request = urllib.request.Request(
+        "https://chatgpt.com/backend-api/codex/responses",
+        data=json.dumps(payload).encode(),
+        headers=openai_codex_headers(config),
+        method="POST",
+    )
+    events = _urlopen_sse_events(request, timeout=120)
+    text, usage = consume_codex_sse_events(events)
+    record_ai_usage("openai", model, reasoning, usage)
+    if not text:
+        raise RuntimeError("OpenAI Codex OAuth response did not include text output.")
+    return text
 
 
 def is_openai_compatible(provider: str) -> bool:
@@ -1712,12 +1970,15 @@ def normalize_anthropic_usage(raw: Any) -> dict[str, Any]:
 def call_openai_compatible(provider: str, task: dict[str, Any], config: dict[str, Any], prompt: str) -> str:
     meta = PROVIDERS[provider]
     model = resolved_model(task, config, provider)
+    messages = [
+        {"role": "system", "content": task.get("system_prompt", "")},
+        {"role": "user", "content": prompt},
+    ]
+    if provider == "openai" and provider_auth_method(config, "openai") == "oauth":
+        return call_openai_codex_oauth(task, config, messages)
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": task.get("system_prompt", "")},
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
     }
     reasoning = resolved_reasoning_effort(task, config, provider)
     if reasoning and supports_reasoning_effort(provider, model):
@@ -1897,6 +2158,8 @@ def call_ai_messages(task: dict[str, Any], config: dict[str, Any], messages: lis
     if is_openai_compatible(provider):
         meta = PROVIDERS[provider]
         model = resolved_model(task, config, provider)
+        if provider == "openai" and provider_auth_method(config, "openai") == "oauth":
+            return call_openai_codex_oauth(task, config, messages)
         payload: dict[str, Any] = {"model": model, "messages": messages}
         reasoning = resolved_reasoning_effort(task, config, provider)
         if reasoning and supports_reasoning_effort(provider, model):
@@ -2081,6 +2344,29 @@ def task_history_path(name: str, run_id: str) -> Path:
     return task_history_dir(name) / f"{safe_run}.md"
 
 
+def chat_history_dir() -> Path:
+    return paths().conversations / "history"
+
+
+def task_chat_history_dir(name: str) -> Path:
+    return chat_history_dir() / task_slug(name)
+
+
+def task_chat_path(name: str, session_id: str, suffix: str = ".md") -> Path:
+    safe_session = re.sub(r"[^0-9A-Za-zTZ_.-]+", "-", session_id).strip("-.") or "session"
+    return task_chat_history_dir(name) / f"{safe_session}{suffix}"
+
+
+def new_chat_session_id(name: str) -> str:
+    base = new_run_id()
+    candidate = base
+    suffix = 1
+    while task_chat_path(name, candidate, ".md").exists() or task_chat_path(name, candidate, ".json").exists():
+        suffix += 1
+        candidate = f"{base}-{suffix}"
+    return candidate
+
+
 def _fence(text: Any) -> str:
     value = str(text)
     ticks = "```"
@@ -2263,7 +2549,176 @@ def build_cited_reply(reply: str, previous_response: str) -> str:
 
 def response_with_line_numbers(response: str) -> str:
     lines = response.splitlines() or [""]
-    return "\n".join(f"L{idx}: {line}" for idx, line in enumerate(lines, 1))
+    return "\n".join(f"{idx} {line}" for idx, line in enumerate(lines, 1))
+
+
+def add_line_numbers(text: str) -> str:
+    lines = [rstrip_ansi_padded_line(line) for line in (text.splitlines() or [""])]
+    width = len(str(len(lines)))
+    return "\n".join(f"{idx:>{width}} {line}" for idx, line in enumerate(lines, 1))
+
+
+def format_conversation_markdown(task_name: str, session_id: str, messages: list[dict[str, str]]) -> str:
+    parts = [f"# Agentick chat: {task_name}", "", f"Session id: `{session_id}`", ""]
+    for idx, message in enumerate(messages, 1):
+        role = str(message.get("role", "message")).title()
+        content = str(message.get("content", "")).rstrip()
+        parts.extend([f"## {idx}. {role}", "", content or "(empty)", ""])
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def save_chat_session(task_name: str, session_id: str, messages: list[dict[str, str]]) -> Path:
+    task_chat_history_dir(task_name).mkdir(parents=True, exist_ok=True)
+    md = task_chat_path(task_name, session_id, ".md")
+    js = task_chat_path(task_name, session_id, ".json")
+    secure_write(md, format_conversation_markdown(task_name, session_id, messages))
+    secure_write(js, json.dumps({"task": task_name, "session_id": session_id, "messages": messages}, indent=2) + "\n")
+    return md
+
+
+def chat_entries(name: str | None = None) -> list[tuple[str, str, Path]]:
+    base = chat_history_dir()
+    if not base.exists():
+        return []
+    files = list(task_chat_history_dir(name).glob("*.md")) if name else list(base.glob("*/*.md"))
+    entries: list[tuple[str, str, Path]] = []
+    for path in files:
+        entries.append((path.parent.name, path.stem, path))
+    return sorted(entries, key=lambda item: item[2].stat().st_mtime, reverse=True)
+
+
+def load_chat_session(name: str, session_id: str | None = None) -> str | None:
+    entries = chat_entries(name)
+    if not entries:
+        return None
+    if session_id:
+        for _task, candidate_id, path in entries:
+            if candidate_id == session_id:
+                return path.read_text(encoding="utf-8", errors="replace")
+        return None
+    return entries[0][2].read_text(encoding="utf-8", errors="replace")
+
+
+def delete_chat_context(name: str, session_id: str | None = None) -> list[str]:
+    entries = chat_entries(name)
+    deleted: list[str] = []
+    for _task, candidate_id, md_path in entries:
+        if session_id and candidate_id != session_id:
+            continue
+        json_path = md_path.with_suffix(".json")
+        for path in (md_path, json_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        deleted.append(candidate_id)
+    try:
+        task_chat_history_dir(name).rmdir()
+    except OSError:
+        pass
+    return deleted
+
+
+def load_chat_session_data(name: str, session_id: str | None = None) -> tuple[str, list[dict[str, str]]] | None:
+    entries = chat_entries(name)
+    if not entries:
+        return None
+    selected: tuple[str, str, Path] | None = None
+    if session_id:
+        selected = next((entry for entry in entries if entry[1] == session_id), None)
+    else:
+        selected = entries[0]
+    if selected is None:
+        return None
+    _task, selected_id, md_path = selected
+    json_path = md_path.with_suffix(".json")
+    if not json_path.exists():
+        raise ValueError(f"Chat session JSON not found: {json_path}")
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError(f"Chat session JSON is missing messages: {json_path}")
+    normalized: list[dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "user"))
+        content = str(message.get("content", ""))
+        normalized.append({"role": role, "content": content})
+    if not normalized:
+        raise ValueError(f"Chat session has no messages: {json_path}")
+    return selected_id, normalized
+
+
+def last_assistant_response(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "assistant":
+            return str(message.get("content", ""))
+    return ""
+
+
+def task_provider_model(task: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, str]:
+    provider = str(task.get("provider") or cfg.get("default_provider") or "openai")
+    model = resolved_model(task, cfg, provider) if provider in PROVIDERS else str(task.get("model") or "unknown-model")
+    return provider, model
+
+
+def warn_context_if_needed(messages: list[dict[str, str]], provider: str, model: str) -> None:
+    usage = context_usage(messages, provider, model)
+    percent = usage.get("percent")
+    if isinstance(percent, float) and percent >= 50.0:
+        print(f"agc warning: {format_context_status(messages, provider, model)}", file=sys.stderr)
+
+
+COMPACT_ACTION = "__AGENTICK_COMPACT__"
+REPLY_VISUAL_ACTION = "__AGENTICK_VISUAL_REPLY__"
+REPLY_PROMPT = "Reply: "
+REPLY_COMMANDS: list[tuple[str, str]] = [
+    ("/exit", "cancel reply and return to the response viewer"),
+    ("/visual", "open $VISUAL/$EDITOR/vim for a multiline reply"),
+]
+COMPACTION_RECENT_MESSAGES = 2
+
+
+def compaction_prompt(older_messages: list[dict[str, str]], retained_tail: list[dict[str, str]]) -> str:
+    return textwrap.dedent(
+        f"""
+        Compact the OLDER Agentick conversation messages into a loss-minimizing continuity summary.
+
+        Algorithm/constraints:
+        - Summarize only OLDER_MESSAGES; RECENT_MESSAGES will be retained verbatim after your summary.
+        - Preserve decisions, constraints, user preferences for this task, file paths, commands, errors, outputs, IDs, and unresolved next steps.
+        - Preserve exact strings when future replies may depend on them: paths, command lines, option names, API names, error text, schema fields, and user-requested wording.
+        - Merge any previous "Compacted conversation summary" into the new summary instead of nesting summaries.
+        - Drop greetings, repeated acknowledgements, transient UI chatter, and low-value prose.
+        - Return compact markdown with these headings only: Goal, Current State, Decisions, Important Details, Open Questions / Next Steps.
+        - Do not say you compacted the conversation.
+
+        OLDER_MESSAGES JSON:
+        {json.dumps(older_messages, ensure_ascii=False, indent=2)}
+
+        RECENT_MESSAGES KEPT VERBATIM AFTER SUMMARY (for context only; do not restate unless needed for continuity):
+        {json.dumps(retained_tail, ensure_ascii=False, indent=2)}
+        """
+    ).strip()
+
+
+def compact_chat_messages(task: dict[str, Any], cfg: dict[str, Any], messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    system_messages = [message for message in messages if message.get("role") == "system"]
+    non_system = [message for message in messages if message.get("role") != "system"]
+    if len(non_system) <= COMPACTION_RECENT_MESSAGES:
+        return messages
+    retained_tail = non_system[-COMPACTION_RECENT_MESSAGES:]
+    older_messages = non_system[:-COMPACTION_RECENT_MESSAGES]
+    summary_task = {
+        **task,
+        "system_prompt": "You are a context compaction engine. Produce dense, faithful continuity summaries with no fluff.",
+        "reasoning_effort": "minimal",
+    }
+    summary = call_ai_messages(summary_task, cfg, [{"role": "user", "content": compaction_prompt(older_messages, retained_tail)}]).strip()
+    prefix = system_messages[:1]
+    compacted = prefix + [{"role": "user", "content": "Compacted conversation summary for continuity:\n\n" + summary}] + retained_tail
+    return compacted
 
 
 def save_conversation(name: str, messages: list[dict[str, str]]) -> Path:
@@ -2298,6 +2753,14 @@ def render_response_ansi(response: str) -> str:
     return console.export_text(clear=True, styles=True)
 
 
+def render_numbered_response_ansi(response: str) -> str:
+    # Render markdown first, then add copyable line numbers to the terminal text.
+    # Numbering before Markdown makes CommonMark treat adjacent lines as one
+    # wrapped paragraph, which collapses examples like "1 foo\n2 bar" onto one
+    # visual line in the conversation viewer.
+    return add_line_numbers(render_response_ansi(response).rstrip("\n"))
+
+
 def _read_pager_key() -> str:
     ch = sys.stdin.read(1)
     if ch != "\x1b":
@@ -2306,6 +2769,38 @@ def _read_pager_key() -> str:
     if seq in {"[5", "[6"}:
         seq += sys.stdin.read(1)
     return ch + seq
+
+
+def reply_command_suggestions(text: str) -> list[tuple[str, str]]:
+    if not text.startswith("/"):
+        return []
+    return [(command, description) for command, description in REPLY_COMMANDS if command.startswith(text)]
+
+
+def render_reply_command_suggestions(text: str) -> str:
+    suggestions = reply_command_suggestions(text)
+    if not suggestions:
+        return f"{YELLOW}unknown command; try /exit or /visual{RESET}" if text.startswith("/") else ""
+    width = max(len(command) for command, _description in suggestions)
+    return "  ".join(f"{CYAN}{command.ljust(width)}{RESET} {description}" for command, description in suggestions)
+
+
+def complete_reply_command(text: str) -> str:
+    suggestions = reply_command_suggestions(text)
+    if not suggestions:
+        return text
+    if len(suggestions) == 1:
+        return suggestions[0][0]
+    return os.path.commonprefix([command for command, _description in suggestions]) or text
+
+
+def resolve_reply_command(text: str) -> str | None:
+    command = text.strip()
+    if command == "/exit":
+        return ""
+    if command == "/visual":
+        return REPLY_VISUAL_ACTION
+    return None
 
 
 def _prompt_line(prompt: str, *, previous_response: str | None = None, old_settings: list[Any] | None = None) -> str:
@@ -2324,10 +2819,12 @@ def _prompt_line(prompt: str, *, previous_response: str | None = None, old_setti
 
     buffer = ""
 
-    def citation_preview(text: str) -> str:
+    def reply_preview(text: str) -> str:
+        if text.startswith("/"):
+            return render_reply_command_suggestions(text)
         ranges = parse_cite_ranges(text)
         if not ranges:
-            return ""
+            return f"{DIM}/exit cancel · /visual editor · Tab autocomplete{RESET}"
         try:
             chunk = extract_citation_chunk(previous_response, ranges[-1])
         except ValueError as exc:
@@ -2341,7 +2838,7 @@ def _prompt_line(prompt: str, *, previous_response: str | None = None, old_setti
         tty.setcbreak(fd)
         sys.stdout.write("\x1b[?25h\n")
         while True:
-            preview = citation_preview(buffer)
+            preview = reply_preview(buffer)
             sys.stdout.write("\r\x1b[2K" + prompt + buffer)
             sys.stdout.write("\x1b[K")
             if preview:
@@ -2350,9 +2847,15 @@ def _prompt_line(prompt: str, *, previous_response: str | None = None, old_setti
             ch = sys.stdin.read(1)
             if ch in {"\r", "\n"}:
                 sys.stdout.write("\n")
+                command_result = resolve_reply_command(buffer)
+                if command_result is not None:
+                    return command_result
                 return buffer
             if ch == "\x03":
-                raise KeyboardInterrupt
+                return ""
+            if ch == "\t":
+                buffer = complete_reply_command(buffer)
+                continue
             if ch in {"\x7f", "\b"}:
                 buffer = buffer[:-1]
                 continue
@@ -2364,24 +2867,114 @@ def _prompt_line(prompt: str, *, previous_response: str | None = None, old_setti
             tty.setcbreak(fd)
 
 
-def conversation_pager(response: str, messages: list[dict[str, str]]) -> str | None:
+def reply_editor_initial(previous_response: str) -> str:
+    numbered = response_with_line_numbers(previous_response)
+    return textwrap.dedent(
+        f"""
+        # Agentick reply editor
+        # Write your follow-up below the marker, then save and quit.
+        # You can cite the previous assistant answer with tokens like @cite:L1C1..L2C5.
+        # Previous assistant answer with line numbers:
+        #
+        {textwrap.indent(numbered, '#   ')}
+        --- AGENTICK REPLY BELOW ---
+
+        """
+    ).lstrip()
+
+
+def parse_reply_editor_value(text: str) -> str:
+    marker = "--- AGENTICK REPLY BELOW ---"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    lines = text.splitlines()
+    while lines and lines[0].lstrip().startswith("#"):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _prompt_editor_reply(previous_response: str, *, old_settings: list[Any] | None = None) -> str:
+    fd = sys.stdin.fileno()
+    if old_settings is not None:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    try:
+        sys.stdout.write("\x1b[?25h\nOpening $VISUAL/$EDITOR for reply…\n")
+        sys.stdout.flush()
+        return parse_reply_editor_value(open_editor(reply_editor_initial(previous_response)))
+    finally:
+        if old_settings is not None:
+            tty.setcbreak(fd)
+
+
+PAGER_HOTKEYS: list[tuple[str, str]] = [
+    ("R", "quick reply"),
+    ("C", "compact context now"),
+    ("q", "quit viewer"),
+    ("?", "show/close all hotkeys"),
+    ("E / V", "open $VISUAL/$EDITOR for multiline reply"),
+    ("Ctrl-S", "save conversation transcript"),
+    ("j / ↓ / Enter", "scroll down"),
+    ("k / h / ↑", "scroll up"),
+    ("Space / PgDn", "page down"),
+    ("b / PgUp", "page up"),
+    ("g", "jump to top"),
+    ("G", "jump to bottom"),
+]
+
+
+def conversation_footer(messages: list[dict[str, str]], provider: str, model: str, top: int, body_height: int, total_lines: int, *, color: bool = True) -> str:
+    context_bits = format_context_status(messages, provider, model, color=color) if provider and model else "Context unknown"
+    end = min(top + body_height, total_lines)
+    return f"{DIM}R reply · C compact · q quit · ? all keys · {context_bits} · {top + 1}-{end}/{total_lines}{RESET}"
+
+
+def hotkey_overlay_text(messages: list[dict[str, str]], provider: str, model: str) -> str:
+    context_bits = format_context_status(messages, provider, model, color=False) if provider and model else "Context unknown"
+    lines = [
+        "Agentick hotkeys",
+        "",
+        "Top hotkeys stay in the footer. Press ? or q to close this overlay and resume.",
+        "",
+        f"{context_bits}",
+        "",
+    ]
+    width = max(len(key) for key, _description in PAGER_HOTKEYS)
+    lines.extend(f"  {key.ljust(width)}  {description}" for key, description in PAGER_HOTKEYS)
+    return "\n".join(lines)
+
+
+def render_hotkey_overlay(messages: list[dict[str, str]], provider: str, model: str, width: int, height: int) -> str:
+    raw_lines = hotkey_overlay_text(messages, provider, model).splitlines()
+    body_height = max(1, height - 1)
+    visible = raw_lines[:body_height]
+    footer = f"{DIM}?/q close overlay · conversation paused, not exited{RESET}"
+    return "\n".join(line[:width] for line in visible + [footer[:width]])
+
+
+def conversation_pager(response: str, messages: list[dict[str, str]], *, provider: str = "", model: str = "") -> str | None:
     if os.environ.get("AGC_NO_PAGER") or not sys.stdin.isatty() or not sys.stdout.isatty():
         return None
-    numbered = response_with_line_numbers(response)
-    rendered = render_response_ansi(numbered)
+    rendered = render_numbered_response_ansi(response)
     lines = rendered.splitlines() or [""]
     top = 0
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
+    overlay = False
+
     def repaint(status: str = "") -> None:
-        nonlocal top
+        nonlocal top, overlay
         size = shutil.get_terminal_size((100, 30))
+        if overlay:
+            sys.stdout.write("\x1b[?25l\x1b[H\x1b[2J")
+            sys.stdout.write(render_hotkey_overlay(messages, provider, model, size.columns, size.lines))
+            sys.stdout.flush()
+            return
         body_height = max(1, size.lines - 2)
         max_top = max(0, len(lines) - body_height)
         top = max(0, min(top, max_top))
         visible = lines[top : top + body_height]
-        footer = f"{DIM}h/k/↑ up · j/↓ down · Space/PgDn · b/PgUp · R reply · Ctrl-S save · q quit · {top + 1}-{min(top + body_height, len(lines))}/{len(lines)}{RESET}"
+        footer = conversation_footer(messages, provider, model, top, body_height, len(lines), color=True)
         sys.stdout.write("\x1b[?25l\x1b[H\x1b[2J")
         sys.stdout.write("\n".join(visible))
         if visible:
@@ -2398,15 +2991,30 @@ def conversation_pager(response: str, messages: list[dict[str, str]]) -> str | N
             repaint(status)
             status = ""
             key = _read_pager_key()
+            if overlay:
+                if key in {"?", "q", "Q", "\x1b", "\x03"}:
+                    overlay = False
+                continue
             size = shutil.get_terminal_size((100, 30))
             page = max(1, size.lines - 3)
-            if key in {"q", "Q", "\x03"}:
+            if key in {"?"}:
+                overlay = True
+            elif key in {"q", "Q", "\x03"}:
                 return None
             if key in {"R", "r"}:
-                reply = _prompt_line("Reply (@cite:L1C1..L2C5 supported): ", previous_response=response, old_settings=old_settings).strip()
+                reply = _prompt_line(REPLY_PROMPT, previous_response=response, old_settings=old_settings).strip()
+                if reply == REPLY_VISUAL_ACTION:
+                    reply = _prompt_editor_reply(response, old_settings=old_settings).strip()
                 if reply:
                     return reply
-                status = f"{YELLOW}Empty reply cancelled.{RESET}"
+                status = f"{YELLOW}Reply cancelled.{RESET}"
+            elif key in {"E", "e", "V", "v"}:
+                reply = _prompt_editor_reply(response, old_settings=old_settings).strip()
+                if reply:
+                    return reply
+                status = f"{YELLOW}Empty editor reply cancelled.{RESET}"
+            elif key in {"C", "c"}:
+                return COMPACT_ACTION
             elif key == "\x13":
                 name = _prompt_line("Save conversation as: ", old_settings=old_settings).strip()
                 if name:
@@ -2519,26 +3127,43 @@ def interactive_output(response: str, headless: bool = False) -> None:
     print(rendered, end="")
 
 
-def conversation_loop(task_name: str, task: dict[str, Any], cfg: dict[str, Any], prompt: str, first_response: str, *, headless: bool = False) -> None:
+def conversation_loop(task_name: str, task: dict[str, Any], cfg: dict[str, Any], prompt: str, first_response: str, *, headless: bool = False, persist_context: bool = True) -> None:
+    session_id = new_chat_session_id(task_name) if persist_context else ""
     messages = [
         {"role": "system", "content": str(task.get("system_prompt", ""))},
         {"role": "user", "content": prompt},
         {"role": "assistant", "content": first_response},
     ]
     response = first_response
+    if persist_context:
+        save_chat_session(task_name, session_id, messages)
+    provider, model = task_provider_model(task, cfg)
     if headless or not sys.stdin.isatty() or not sys.stdout.isatty():
         interactive_output(response, headless=headless)
         return
     while True:
-        reply = conversation_pager(response, messages)
+        reply = conversation_pager(response, messages, provider=provider, model=model)
         if not reply:
             return
+        if reply == COMPACT_ACTION:
+            try:
+                messages = with_loader(f"Compacting {task_name}…", lambda: compact_chat_messages(task, cfg, messages))
+                if persist_context:
+                    save_chat_session(task_name, session_id, messages)
+                response = last_assistant_response(messages) or response
+            except (RuntimeError, ValueError, urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, urllib.error.HTTPError) as exc:
+                print(f"agc error: {exc}", file=sys.stderr)
+                return
+            continue
         try:
             user_content = build_cited_reply(reply, response)
         except ValueError as exc:
             print(f"agc cite error: {exc}", file=sys.stderr)
             continue
         messages.append({"role": "user", "content": user_content})
+        if persist_context:
+            save_chat_session(task_name, session_id, messages)
+        warn_context_if_needed(messages, provider, model)
         try:
             response = with_loader(f"Continuing {task_name}…", lambda: call_ai_messages(task, cfg, messages))
         except urllib.error.HTTPError as exc:
@@ -2548,10 +3173,12 @@ def conversation_loop(task_name: str, task: dict[str, Any], cfg: dict[str, Any],
             print(f"agc error: {exc}", file=sys.stderr)
             return
         messages.append({"role": "assistant", "content": response})
+        if persist_context:
+            save_chat_session(task_name, session_id, messages)
         save_task_run_log(task_name, response, agent=False)
 
 
-def run_task_cmd(name: str, argv: list[str], headless: bool = False, agent: bool = False, perms: AgentPermissions | None = None, edit_args: bool = False) -> int:
+def run_task_cmd(name: str, argv: list[str], headless: bool = False, agent: bool = False, perms: AgentPermissions | None = None, edit_args: bool = False, no_context: bool = False) -> int:
     cfg = load_config()
     if not enforce_ready_or_setup(cfg):
         return 2
@@ -2588,7 +3215,7 @@ def run_task_cmd(name: str, argv: list[str], headless: bool = False, agent: bool
         print(f"agc error: {exc}", file=sys.stderr)
         return 1
     save_task_run_log(name, response, agent=use_agent)
-    conversation_loop(name, task, cfg, prompt, response, headless=headless)
+    conversation_loop(name, task, cfg, prompt, response, headless=headless, persist_context=not no_context)
     return 0
 
 
@@ -2656,6 +3283,256 @@ def history_cmd(args: argparse.Namespace) -> int:
         size = path.stat().st_size
         print(f"  {GREEN}{task}{RESET}  {entry_id}  {DIM}{stamp}  {size} bytes{RESET}")
     print(f"\nView one with: agc history view <task> <run-id>")
+    return 0
+
+
+def chat_task_and_session(name: str, session_id: str | None) -> tuple[dict[str, Any], dict[str, Any], str, list[dict[str, str]]] | int:
+    cfg = load_config()
+    if not enforce_ready_or_setup(cfg):
+        return 2
+    assert cfg is not None
+    task = load_task(name)
+    if task is None:
+        print(f"Unknown task: {name}", file=sys.stderr)
+        return 2
+    task_provider = task.get("provider") or cfg.get("default_provider")
+    if not enforce_ready_or_setup(cfg, str(task_provider) if task_provider else None):
+        return 2
+    try:
+        loaded = load_chat_session_data(name, session_id)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"agc error: {exc}", file=sys.stderr)
+        return 1
+    if loaded is None:
+        if session_id:
+            print(f"No chat session found for {name}: {session_id}", file=sys.stderr)
+        else:
+            print(f"No chat sessions for task: {name}", file=sys.stderr)
+        return 2
+    selected_id, messages = loaded
+    return task, cfg, selected_id, messages
+
+
+def chat_context_cmd(name: str, session_id: str | None, args: argparse.Namespace) -> int:
+    loaded = chat_task_and_session(name, session_id)
+    if isinstance(loaded, int):
+        return loaded
+    task, cfg, selected_id, messages = loaded
+    provider, model = task_provider_model(task, cfg)
+    interactive_output(format_context_report(name, selected_id, messages, provider, model), headless=bool(getattr(args, "headless", False)))
+    return 0
+
+
+def compact_chat_cmd(name: str, session_id: str | None, args: argparse.Namespace) -> int:
+    loaded = chat_task_and_session(name, session_id)
+    if isinstance(loaded, int):
+        return loaded
+    task, cfg, selected_id, messages = loaded
+    if len(messages) <= 4:
+        print(f"Chat session {selected_id} is already small; nothing to compact.")
+        return 0
+    reset_ai_usage()
+    try:
+        compacted = with_loader(f"Compacting {name}…", lambda: compact_chat_messages(task, cfg, messages))
+    except urllib.error.HTTPError as exc:
+        print(f"agc error: {http_error_detail(exc)}", file=sys.stderr)
+        return 1
+    except (RuntimeError, ValueError, urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        print(f"agc error: {exc}", file=sys.stderr)
+        return 1
+    save_chat_session(name, selected_id, compacted)
+    provider, model = task_provider_model(task, cfg)
+    before = format_context_status(messages, provider, model)
+    after = format_context_status(compacted, provider, model)
+    print(f"Compacted chat session: {selected_id}")
+    print(f"Before: {before}")
+    print(f"After:  {after}")
+    return 0
+
+
+def reset_chat_cmd(name: str, session_id: str | None, args: argparse.Namespace) -> int:
+    if not name or not valid_task_name(name):
+        print("Task name must be 1-81 chars: letters, numbers, dot, underscore, dash.", file=sys.stderr)
+        return 2
+    entries = chat_entries(name)
+    matching = [entry_id for _task, entry_id, _path in entries if not session_id or entry_id == session_id]
+    if not matching:
+        if session_id:
+            print(f"No chat session found for {name}: {session_id}", file=sys.stderr)
+        else:
+            print(f"No chat sessions for task: {name}", file=sys.stderr)
+        return 2
+    if not getattr(args, "yes", False):
+        if getattr(args, "no_interactive", False) or not sys.stdin.isatty():
+            target = f"{name} {session_id}" if session_id else name
+            print(f"Refusing to reset chat context for {target!r} without --yes in non-interactive mode.", file=sys.stderr)
+            return 2
+        try:
+            prompt = f"Reset chat context for {name!r} session {session_id!r}? Type the session id to confirm: " if session_id else f"Reset all chat context for {name!r}? Type the task name to confirm: "
+            answer = input(prompt).strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.", file=sys.stderr)
+            return 130
+        expected = session_id or name
+        if answer != expected:
+            print("Reset cancelled.")
+            return 0
+    deleted = delete_chat_context(name, session_id)
+    if session_id:
+        print(f"Reset chat context: {name} {session_id}")
+    else:
+        print(f"Reset chat context: {name} ({len(deleted)} sessions)")
+    return 0
+
+
+def resume_chat_cmd(name: str, session_id: str | None, args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if not enforce_ready_or_setup(cfg):
+        return 2
+    assert cfg is not None
+    task = load_task(name)
+    if task is None:
+        print(f"Unknown task: {name}", file=sys.stderr)
+        return 2
+    task_provider = task.get("provider") or cfg.get("default_provider")
+    if not enforce_ready_or_setup(cfg, str(task_provider) if task_provider else None):
+        return 2
+    try:
+        loaded = load_chat_session_data(name, session_id)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"agc error: {exc}", file=sys.stderr)
+        return 1
+    if loaded is None:
+        if session_id:
+            print(f"No chat session found for {name}: {session_id}", file=sys.stderr)
+        else:
+            print(f"No chat sessions for task: {name}", file=sys.stderr)
+        return 2
+    selected_id, messages = loaded
+    provider, model = task_provider_model(task, cfg)
+    response = last_assistant_response(messages)
+    if not response:
+        print(f"Chat session has no assistant response: {selected_id}", file=sys.stderr)
+        return 2
+
+    explicit_reply = getattr(args, "reply", None)
+    edit_reply = bool(getattr(args, "edit_reply", False))
+    headless = bool(getattr(args, "headless", False))
+    if explicit_reply:
+        replies: list[str | None] = [str(explicit_reply).strip()]
+    elif edit_reply:
+        try:
+            replies = [parse_reply_editor_value(open_editor(reply_editor_initial(response))).strip()]
+        except OSError as exc:
+            print(f"agc error: {exc}", file=sys.stderr)
+            return 1
+    elif headless or not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("chats resume needs --reply/--edit-reply in non-interactive mode", file=sys.stderr)
+        return 2
+    else:
+        replies = []
+
+    reset_ai_usage()
+    while True:
+        if replies:
+            reply = replies.pop(0) or ""
+        else:
+            reply = conversation_pager(response, messages, provider=provider, model=model) or ""
+        if not reply:
+            return 0
+        if reply == COMPACT_ACTION:
+            try:
+                messages = with_loader(f"Compacting {name}…", lambda: compact_chat_messages(task, cfg, messages))
+                save_chat_session(name, selected_id, messages)
+                response = last_assistant_response(messages) or response
+            except (RuntimeError, ValueError, urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, urllib.error.HTTPError) as exc:
+                print(f"agc error: {exc}", file=sys.stderr)
+                return 1
+            continue
+        try:
+            user_content = build_cited_reply(reply, response)
+        except ValueError as exc:
+            print(f"agc cite error: {exc}", file=sys.stderr)
+            if explicit_reply or edit_reply or headless:
+                return 2
+            continue
+        messages.append({"role": "user", "content": user_content})
+        save_chat_session(name, selected_id, messages)
+        warn_context_if_needed(messages, provider, model)
+        try:
+            response = with_loader(f"Resuming {name}…", lambda: call_ai_messages(task, cfg, messages))
+        except urllib.error.HTTPError as exc:
+            print(f"agc error: {http_error_detail(exc)}", file=sys.stderr)
+            return 1
+        except (RuntimeError, ValueError, urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
+            print(f"agc error: {exc}", file=sys.stderr)
+            return 1
+        messages.append({"role": "assistant", "content": response})
+        save_chat_session(name, selected_id, messages)
+        save_task_run_log(name, response, agent=False)
+        if explicit_reply or edit_reply or headless:
+            interactive_output(response, headless=headless)
+            return 0
+
+
+def chats_cmd(args: argparse.Namespace) -> int:
+    action = getattr(args, "action", None) or "list"
+    name = getattr(args, "name", None)
+    session_id = getattr(args, "session_id", None)
+    headless = bool(getattr(args, "headless", False))
+    if action == "view":
+        if not name:
+            print("chats view requires a task name", file=sys.stderr)
+            return 2
+        content = load_chat_session(name, session_id)
+        if content is None:
+            if session_id:
+                print(f"No chat session found for {name}: {session_id}", file=sys.stderr)
+            else:
+                print(f"No chat sessions for task: {name}", file=sys.stderr)
+            return 2
+        interactive_output(content, headless=headless)
+        return 0
+    if action == "resume":
+        if not name:
+            print("chats resume requires a task name", file=sys.stderr)
+            return 2
+        return resume_chat_cmd(name, session_id, args)
+    if action == "context":
+        if not name:
+            print("chats context requires a task name", file=sys.stderr)
+            return 2
+        return chat_context_cmd(name, session_id, args)
+    if action == "compact":
+        if not name:
+            print("chats compact requires a task name", file=sys.stderr)
+            return 2
+        return compact_chat_cmd(name, session_id, args)
+    if action in {"reset", "clear"}:
+        if not name:
+            print("chats reset requires a task name", file=sys.stderr)
+            return 2
+        return reset_chat_cmd(name, session_id, args)
+    if action != "list":
+        name = action
+    entries = chat_entries(name)
+    print(banner())
+    if not entries:
+        if name:
+            print(f"No chat sessions for task: {name}")
+        else:
+            print("No chat sessions yet. Run a task first.")
+        return 0
+    print("Chat sessions:")
+    for task, entry_id, path in entries[:50]:
+        stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        size = path.stat().st_size
+        print(f"  {GREEN}{task}{RESET}  {entry_id}  {DIM}{stamp}  {size} bytes{RESET}")
+    print(f"\nView one with: agc chats view <task> <session-id>")
+    print(f"Resume one with: agc chats resume <task> <session-id>")
+    print(f"Check context with: agc chats context <task> <session-id>")
+    print(f"Compact one with: agc chats compact <task> <session-id>")
+    print(f"Reset one with: agc chats reset <task> <session-id> --yes")
     return 0
 
 
@@ -2898,6 +3775,104 @@ def routines_cmd(args: argparse.Namespace) -> int:
         print("No routine tasks yet.")
     return 0
 
+
+AGC_CREDENTIAL_PRESERVE_NAMES = {
+    "config.json",
+    "credentials",
+    "credentials.json",
+    "oauth",
+    "oauth.json",
+    "tokens.json",
+}
+
+
+def clean_preserved_paths() -> set[Path]:
+    home = paths().home
+    return {home / name for name in AGC_CREDENTIAL_PRESERVE_NAMES}
+
+
+def clean_targets() -> list[Path]:
+    home = paths().home
+    if not home.exists():
+        return []
+    preserved = clean_preserved_paths()
+    return sorted((child for child in home.iterdir() if child not in preserved), key=lambda item: item.name)
+
+
+def installed_routines_from_tasks() -> list[tuple[str, dict[str, Any]]]:
+    base = paths().tasks
+    if not base.exists():
+        return []
+    routines: list[tuple[str, dict[str, Any]]] = []
+    for file in sorted(base.glob("*.json")):
+        try:
+            task = json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        routine = task.get("routine") if isinstance(task, dict) else None
+        if isinstance(routine, dict) and routine.get("installed"):
+            name = str(task.get("name") or file.stem)
+            routines.append((name, routine))
+    return routines
+
+
+def clean_cmd(args: argparse.Namespace) -> int:
+    home = paths().home
+    targets = clean_targets()
+    preserved = sorted(path.name for path in clean_preserved_paths() if path.exists())
+    if not home.exists() or not targets:
+        print(banner())
+        kept = f" Preserved: {', '.join(preserved)}." if preserved else ""
+        print(f"Nothing to clean in {home}.{kept}")
+        return 0
+    if not getattr(args, "yes", False):
+        if getattr(args, "no_interactive", False) or not sys.stdin.isatty():
+            print("Refusing to clean Agentick data without --yes in non-interactive mode.", file=sys.stderr)
+            print("This removes tasks, conversations, run history, routines, logs, and caches but keeps credentials.", file=sys.stderr)
+            return 2
+        print(banner())
+        print(f"This will remove all Agentick local data under {home} except credentials/config:")
+        for target in targets[:12]:
+            print(f"  - {target.name}")
+        if len(targets) > 12:
+            print(f"  - ...and {len(targets) - 12} more")
+        answer = input("Clean Agentick data? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Clean cancelled.")
+            return 0
+
+    schedule_warnings: list[str] = []
+    for name, routine in installed_routines_from_tasks():
+        try:
+            stop_routine_schedule(name, routine)
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            schedule_warnings.append(f"{name}: {exc}")
+
+    removed = 0
+    for target in targets:
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            print(f"Could not remove {target}: {exc}", file=sys.stderr)
+            return 1
+
+    print(banner())
+    print(f"{GREEN}Cleaned Agentick data:{RESET} removed {removed} item(s) from {home}")
+    if preserved:
+        print(f"Preserved credentials/config: {', '.join(preserved)}")
+    else:
+        print("No local credentials/config were present to preserve.")
+    for warning in schedule_warnings:
+        print(f"agc warning: could not stop routine schedule before cleanup: {warning}", file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agc",
@@ -2913,7 +3888,14 @@ def build_parser() -> argparse.ArgumentParser:
               agc tasks
               agc history
               agc history view pr-risk <run-id>
+              agc chats
+              agc chats view pr-risk <session-id>
+              agc chats resume pr-risk <session-id>
+              agc chats context pr-risk <session-id>
+              agc chats compact pr-risk <session-id>
+              agc chats reset pr-risk <session-id> --yes
               agc pr-risk ./src/payments/checkout.ts:L80..L180
+              agc pr-risk ./src/payments/checkout.ts --no-context
               agc incident-handoff --edit-args
               agc api-migration ./openapi-v1.json ./openapi-v2.json > migration.md
               agc branch-watch main --agent --allow-write --allow-shell
@@ -2921,10 +3903,11 @@ def build_parser() -> argparse.ArgumentParser:
               agc routines view branch-watch
               agc routines stop branch-watch
               agc routines delete branch-watch --yes
+              agc clean
               agc release-drafter ./git-log.txt > CHANGELOG-draft.md
 
             output:
-              Interactive terminals open a rich markdown viewer with h/j/k scrolling, R replies, and Ctrl-S save.
+              Interactive terminals open a rich markdown viewer with h/j/k scrolling, context meter, R replies, E editor replies, C compaction, and Ctrl-S save.
               Redirected stdout writes raw model output, so `agc task > file.md` is clean.
             """
         ).strip(),
@@ -2935,6 +3918,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-shell", action="store_true", help="allow agentic tasks to run shell commands in the current directory")
     parser.add_argument("--allow-net", action="store_true", help="allow agentic tasks to make outbound HTTP(S) requests")
     parser.add_argument("--allow-commit", action="store_true", help="allow agentic tasks to create git commits")
+    parser.add_argument("--no-context", action="store_true", help="do not persist chat context for this task run")
     sub = parser.add_subparsers(dest="command")
 
     setup = sub.add_parser("setup", help="configure an AI provider")
@@ -2980,6 +3964,16 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--headless", action="store_true", help="print raw markdown instead of opening the viewer")
     history.add_argument("--no-interactive", action="store_true")
 
+    chats = sub.add_parser("chats", help="list, view, resume, inspect, compact, or reset persisted chat sessions")
+    chats.add_argument("action", nargs="?", help="list, view, resume, context, compact, reset, or a task name to filter")
+    chats.add_argument("name", nargs="?", help="task name for `chats view`")
+    chats.add_argument("session_id", nargs="?", help="session id from `agc chats`")
+    chats.add_argument("--reply", help="resume once with this reply; useful for scripts/non-TTY shells")
+    chats.add_argument("--edit-reply", action="store_true", help="open $VISUAL/$EDITOR/vim for a multiline resume reply")
+    chats.add_argument("--headless", action="store_true", help="print raw markdown instead of opening the viewer")
+    chats.add_argument("--yes", "-y", action="store_true", help="confirm resetting chat context non-interactively")
+    chats.add_argument("--no-interactive", action="store_true")
+
     routines = sub.add_parser("routines", help="create, list, start, stop, edit, delete, or view routine tasks")
     routines.add_argument("action", nargs="?", choices=["list", "create", "view", "logs", "status", "start", "stop", "edit", "delete"], default="list")
     routines.add_argument("name", nargs="?")
@@ -2995,6 +3989,10 @@ def build_parser() -> argparse.ArgumentParser:
     routines.add_argument("--yes", "-y", action="store_true", help="confirm destructive routine actions non-interactively")
     routines.add_argument("--headless", action="store_true", help="print the run log instead of opening the scrollable viewer")
     routines.add_argument("--no-interactive", action="store_true")
+
+    clean = sub.add_parser("clean", help="remove all local Agentick data except saved provider credentials")
+    clean.add_argument("--yes", "-y", action="store_true", help="clean without an interactive confirmation prompt")
+    clean.add_argument("--no-interactive", action="store_true")
     return parser
 
 
@@ -3007,14 +4005,15 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print(banner())
         print("Run: agc new OR agc <task-name>")
         return 0
-    global_flags = {"--no-interactive", "--agent", "--allow-write", "--allow-shell", "--allow-net", "--allow-commit", "--edit-args", "--args-editor"}
+    global_flags = {"--no-interactive", "--agent", "--allow-write", "--allow-shell", "--allow-net", "--allow-commit", "--edit-args", "--args-editor", "--no-context"}
     command_token = next((item for item in argv if item not in global_flags), "")
-    if command_token and command_token not in {"setup", "new", "edit", "delete", "rm", "tasks", "history", "routines", "-h", "--help"}:
+    if command_token and command_token not in {"setup", "new", "edit", "delete", "rm", "tasks", "history", "chats", "routines", "clean", "-h", "--help"}:
         headless = False
         agent = False
         edit_args = False
+        no_context = False
         perms = AgentPermissions()
-        for flag in ["--headless", "--agent", "--edit-args", "--args-editor", "--allow-write", "--allow-shell", "--allow-net", "--allow-commit", "--no-interactive"]:
+        for flag in ["--headless", "--agent", "--edit-args", "--args-editor", "--allow-write", "--allow-shell", "--allow-net", "--allow-commit", "--no-interactive", "--no-context"]:
             while flag in argv:
                 if flag == "--headless":
                     headless = True
@@ -3022,6 +4021,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     agent = True
                 elif flag in {"--edit-args", "--args-editor"}:
                     edit_args = True
+                elif flag == "--no-context":
+                    no_context = True
                 elif flag == "--allow-write":
                     perms.write = True
                 elif flag == "--allow-shell":
@@ -3032,7 +4033,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     perms.commit = True
                 argv.remove(flag)
         name, rest = argv[0], argv[1:]
-        return run_task_cmd(name, rest, headless=headless, agent=agent, perms=perms, edit_args=edit_args)
+        return run_task_cmd(name, rest, headless=headless, agent=agent, perms=perms, edit_args=edit_args, no_context=no_context)
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "setup":
@@ -3062,11 +4063,18 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if not enforce_ready_or_setup(cfg):
             return 2
         return history_cmd(args)
+    if args.command == "chats":
+        cfg = load_config()
+        if not enforce_ready_or_setup(cfg):
+            return 2
+        return chats_cmd(args)
     if args.command == "routines":
         cfg = load_config()
         if not enforce_ready_or_setup(cfg):
             return 2
         return routines_cmd(args)
+    if args.command == "clean":
+        return clean_cmd(args)
     if args.command is None and argv and argv[0] in {"-h", "--help"}:
         return 0
     if not enforce_ready_or_setup(load_config()):

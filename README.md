@@ -293,9 +293,13 @@ LM Studio, Ollama Cloud, and Tencent TokenHub. Most of these use
 OpenAI-compatible `/chat/completions`; Anthropic uses the native Messages API;
 Gemini uses Google `generateContent`.
 
-OpenAI OAuth/device-code setup is also available from the interactive setup
-picker. Agentick opens your browser or shows a device code; you do not need to
-paste a token for the interactive path.
+OpenAI Codex OAuth/device-code setup is also available from the interactive
+setup picker. Agentick opens your browser or shows a device code; you do not
+need to paste a token for the interactive path. Codex OAuth uses the
+ChatGPT/Codex backend (`chatgpt.com/backend-api/codex/responses`), not the
+platform API-key endpoint, so a stray `OPENAI_API_KEY` environment variable will
+not override a saved Codex OAuth token. Choose `OpenAI (API key)` instead when
+you want to use a platform key from `platform.openai.com`.
 
 ## Creating tasks
 
@@ -493,13 +497,17 @@ git_commit    git add -A && git commit -m, requires --allow-commit
 Agentick writes the last tool transcript to
 `~/.agentick/last_agent_trace.json`, writes the latest per-task markdown run log
 to `~/.agentick/runs/<task-name>.md`, and also keeps timestamped execution
-history under `~/.agentick/runs/history/<task-name>/<run-id>.md`. Run logs
-include the task/response, model, reasoning effort, and provider-reported token
-usage when available (`total`, `input`, and `output` tokens). This makes agentic
-runs inspectable when a model makes a bad call and lets you view older answers
-after newer runs replace the latest log. File paths are constrained to
-the current working directory; writes, shell commands, outbound HTTP(S) requests,
-and commits are opt-in per run.
+history under `~/.agentick/runs/history/<task-name>/<run-id>.md`. Full task chat
+sessions are persisted under
+`~/.agentick/conversations/history/<task-name>/<session-id>.md` plus a JSON copy
+unless the run used `--no-context`.
+Run logs include the task/response, model, reasoning effort, and
+provider-reported token usage when available (`total`, `input`, and `output`
+tokens). This makes agentic runs inspectable when a model makes a bad call, lets
+you view older answers after newer runs replace the latest log, and lets you
+reopen the full prompt/reply transcript for a particular execution session. File
+paths are constrained to the current working directory; writes, shell commands,
+outbound HTTP(S) requests, and commits are opt-in per run.
 
 View the last prepared result for any task/routine with the same scrollable
 viewer used for model responses:
@@ -517,6 +525,61 @@ agc history implement             # previous answers for one task
 agc history view implement <run-id>
 agc history view implement <run-id> --headless
 ```
+
+List persisted chat sessions, reopen the full transcript for a specific
+execution session, or resume that session later:
+
+```bash
+agc chats                         # recent chat sessions for all tasks
+agc chats implement               # chat sessions for one task
+agc chats view implement <session-id>
+agc chats view implement <session-id> --headless
+agc chats resume implement <session-id>
+agc chats resume implement <session-id> --reply "continue from here" --headless
+agc chats resume implement <session-id> --edit-reply
+agc chats context implement <session-id> --headless
+agc chats compact implement <session-id>
+agc chats reset implement <session-id> --yes   # delete one saved context
+agc chats reset implement --yes                # delete all saved context for a task
+```
+
+Use `--no-context` on a fresh task run when you want a one-off answer and do not
+want Agentick to persist a resumable chat transcript:
+
+```bash
+agc implement ./src/app.py --no-context
+```
+
+`agc chats resume` loads the saved JSON transcript, appends your new reply, calls
+the configured provider with the full prior message history, and overwrites the
+same `.md`/`.json` session files with the extended conversation. In an
+interactive terminal it opens the same response viewer as a fresh run. The footer
+keeps only the top hotkeys visible (`R` reply, `C` compact context, `q` quit) plus
+`?` for a full hotkey overlay; press `?` or `q` inside that overlay to close it
+and resume. `E`/`V` opens `$VISUAL`, `$EDITOR`, or `vim` for a multiline reply.
+Inside the quick `R` reply prompt, type `/exit` to cancel back to the viewer or
+`/visual` to switch into the editor; typing `/` shows those commands and `Tab`
+autocompletes them. In non-TTY shells or scripts, pass `--reply` for a one-shot resume or
+`--edit-reply` to compose the reply in your editor; use `--headless` for raw
+stdout suitable for redirection.
+
+`agc chats context` gives a local preflight estimate of the current session's
+input context: estimated tokens, model context window when Agentick knows it, and
+percentage used. The interactive response viewer shows the same context meter in
+its footer and warns with `compact soon` once estimated usage reaches about 50%
+of the known context window. Exact provider-reported usage is still recorded
+after each model call in `agc history view`; the context meter is intentionally a
+before-send estimate so you can act before a request fails.
+
+`agc chats compact` asks the configured model to summarize the older saved
+messages with a low-latency compaction prompt, keeps the latest reply turn
+verbatim, and rewrites the same session `.md`/`.json` files as a compacted
+continuity summary plus recent turns. In the interactive viewer, press `C` to do
+the same compaction in place, then keep chatting from the compacted session.
+
+`agc chats reset` deletes persisted chat context. Pass a session id to remove one
+saved transcript, or omit it to remove all saved transcripts for that task. It is
+destructive, so non-interactive use requires `--yes`.
 
 ### Routine scheduling
 
@@ -624,15 +687,26 @@ b/PgUp      page up
 g           top
 G           bottom
 R           reply and continue the conversation
+E/V         compose a reply in $VISUAL/$EDITOR/vim
+C           compact the persisted chat session in place
 Ctrl-S      save the conversation with a name
 q           quit
 ```
 
-When a task response is open in an interactive terminal, press `R` to reply. The
-reply is sent with the prior task prompt and response as conversation history, so
-you can ask follow-up questions without starting over. Press `Ctrl-S` from the
-viewer to save the conversation under `~/.agentick/conversations/<name>.md` plus
-a JSON copy.
+When a task response is open in an interactive terminal, press `R` for a quick
+one-line reply or `E`/`V` to compose a multiline reply in `$VISUAL`, `$EDITOR`,
+or `vim`. In quick reply mode, `/exit` cancels and returns to the response viewer,
+`/visual` opens the editor, and `Tab` autocompletes slash commands after you type
+`/`. The reply is sent with the prior task prompt and response as
+conversation history, so you can ask follow-up questions without starting over.
+Agentick automatically persists each execution session under
+`~/.agentick/conversations/history/<task-name>/<session-id>.md` and `.json`;
+reopen it with `agc chats view <task-name> <session-id>` or continue it with
+`agc chats resume <task-name> <session-id>`. The viewer footer shows estimated
+context used and warns around 50%; press `C` to compact the session in place or
+run `agc chats compact <task-name> <session-id>` later. Press `Ctrl-S` from the
+viewer to additionally save a named copy under
+`~/.agentick/conversations/<name>.md` plus JSON.
 
 You can cite exact text from the previous AI response in a follow-up using
 line/column coordinates:
@@ -716,12 +790,19 @@ agc name --agent --allow-write --allow-shell  # run with agent tools
 agc history               # list previous task answers
 agc history name          # list previous answers for one task
 agc history view name <run-id>
+agc chats                 # list persisted chat sessions
+agc chats name            # list chat sessions for one task
+agc chats view name <session-id>
+agc chats resume name <session-id>
+agc chats context name <session-id>
+agc chats compact name <session-id>
 agc routines              # list saved routine tasks
 agc routines create name --every 1h       # install launchd/cron routine schedule
 agc routines status name
 agc routines stop name
 agc routines edit name --every 30m
 agc routines delete name --yes
+agc clean                 # delete local tasks/history/chats/routines, keep credentials
 agc routines view name    # open the last run log in the scrollable viewer
 agc --help
 ```
@@ -739,6 +820,10 @@ ag ...
   default.
 - API keys/OAuth tokens are stored in `~/.agentick/config.json`; this file is
   written as `0600` on POSIX systems.
+- `agc clean` removes local Agentick tasks, conversations, run history, routine
+  artifacts, logs, and caches after a `[y/N]` confirmation (or `--yes` for
+  scripts). It preserves `config.json` and local credential/token directories so
+  provider auth remains configured.
 - Do not commit `~/.agentick`, `.test-agentick-home`, `.smoke-agentick-home`,
   local `.env` files, or provider credentials.
 - The repository intentionally uses placeholder keys in tests only, such as

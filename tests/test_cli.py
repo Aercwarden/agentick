@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import builtins
 import json
 import os
 import subprocess
@@ -38,6 +40,14 @@ def test_help_documents_core_examples_and_redirect_output():
     assert "agc edit pr-risk" in proc.stdout
     assert "agc delete pr-risk --yes" in proc.stdout
     assert "agc release-drafter ./git-log.txt > CHANGELOG-draft.md" in proc.stdout
+    assert "agc chats view pr-risk <session-id>" in proc.stdout
+    assert "agc chats context pr-risk <session-id>" in proc.stdout
+    assert "agc chats compact pr-risk <session-id>" in proc.stdout
+    assert "agc chats reset pr-risk <session-id> --yes" in proc.stdout
+    assert "agc clean" in proc.stdout
+    assert "agc pr-risk ./src/payments/checkout.ts --no-context" in proc.stdout
+    assert "context meter" in proc.stdout
+    assert "C compaction" in proc.stdout
     assert "Redirected stdout writes raw model output" in proc.stdout
 
 
@@ -46,6 +56,75 @@ def test_first_run_without_config_enters_setup_guidance():
     assert proc.returncode == 2
     assert "Agentick is not ready" in proc.stderr
     assert "Run `agc setup`" in proc.stderr
+
+
+def test_clean_requires_confirmation_and_preserves_credentials(tmp_path: Path):
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.json"
+    config.write_text(json.dumps({
+        "default_provider": "openai",
+        "providers": {"openai": {"api_key": "test-key", "model": "gpt-4o-mini"}},
+    }))
+    credentials_dir = home / "credentials"
+    credentials_dir.mkdir()
+    (credentials_dir / "provider.token").write_text("token")
+    for rel in [
+        "tasks/review.json",
+        "conversations/history/review/session.md",
+        "runs/history/review/run.md",
+        "routines/review.log",
+        "last_prompt.txt",
+        "last_agent_trace.json",
+    ]:
+        path = home / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("runtime data")
+
+    refused = run_agc("clean", "--no-interactive", env={"AGENTICK_HOME": str(home)})
+    assert refused.returncode == 2
+    assert "without --yes" in refused.stderr
+    assert (home / "tasks" / "review.json").exists()
+
+    cleaned = run_agc("clean", "--yes", env={"AGENTICK_HOME": str(home)})
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert "Cleaned Agentick data" in cleaned.stdout
+    assert "Preserved credentials/config" in cleaned.stdout
+    assert config.exists()
+    assert json.loads(config.read_text())["providers"]["openai"]["api_key"] == "test-key"
+    assert (credentials_dir / "provider.token").read_text() == "token"
+    assert not (home / "tasks").exists()
+    assert not (home / "conversations").exists()
+    assert not (home / "runs").exists()
+    assert not (home / "routines").exists()
+    assert not (home / "last_prompt.txt").exists()
+
+
+def test_clean_interactive_y_n_confirmation(monkeypatch, tmp_path: Path, capsys):
+    from agentick import cli
+
+    home = tmp_path / "home"
+    task = home / "tasks" / "review.json"
+    task.parent.mkdir(parents=True)
+    task.write_text("{}")
+    (home / "config.json").write_text(json.dumps({"providers": {}}))
+    monkeypatch.setenv("AGENTICK_HOME", str(home))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "n")
+
+    cancelled = cli.clean_cmd(argparse.Namespace(yes=False, no_interactive=False))
+    out = capsys.readouterr()
+    assert cancelled == 0
+    assert "Clean cancelled." in out.out
+    assert task.exists()
+
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "y")
+    cleaned = cli.clean_cmd(argparse.Namespace(yes=False, no_interactive=False))
+    out = capsys.readouterr()
+    assert cleaned == 0
+    assert "Cleaned Agentick data" in out.out
+    assert not (home / "tasks").exists()
+    assert (home / "config.json").exists()
 
 
 def test_setup_writes_secure_config_and_prints_usage():
@@ -306,6 +385,62 @@ def test_provider_key_reads_oauth_access_token_and_env_override(monkeypatch):
     assert provider_key(config, "grok") == "stored-token"
     monkeypatch.setenv("AGC_GROK_OAUTH_TOKEN", "env-token")
     assert provider_key(config, "grok") == "env-token"
+
+
+def test_provider_key_does_not_mix_openai_api_key_into_oauth(monkeypatch):
+    from agentick.cli import provider_key
+
+    config = {
+        "providers": {
+            "openai": {
+                "auth_method": "oauth",
+                "access_token": "oauth-token",
+            }
+        }
+    }
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    assert provider_key(config, "openai") == "oauth-token"
+    monkeypatch.setenv("AGC_OPENAI_OAUTH_TOKEN", "oauth-env-token")
+    assert provider_key(config, "openai") == "oauth-env-token"
+
+
+def test_openai_oauth_calls_codex_responses_endpoint(monkeypatch):
+    from agentick import cli
+
+    captured = {}
+
+    def fake_urlopen_sse_events(request, *, timeout=120.0):
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.header_items())
+        captured["payload"] = json.loads(request.data.decode())
+        captured["timeout"] = timeout
+        return [
+            {"type": "response.output_text.delta", "delta": "answer"},
+            {"type": "response.completed", "response": {"usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}}},
+        ]
+
+    monkeypatch.setattr(cli, "_urlopen_sse_events", fake_urlopen_sse_events)
+    cli.reset_ai_usage()
+    config = {
+        "providers": {
+            "openai": {
+                "auth_method": "oauth",
+                "access_token": "oauth-token",
+                "model": "gpt-5.5",
+                "reasoning_effort": "minimal",
+            }
+        }
+    }
+    task = {"provider": "openai", "system_prompt": "Be brief."}
+
+    assert cli.call_openai_compatible("openai", task, config, "hello") == "answer"
+    assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert captured["headers"]["Authorization"] == "Bearer oauth-token"
+    assert captured["headers"]["Originator"] == "codex_cli_rs"
+    assert captured["payload"]["instructions"] == "Be brief."
+    assert captured["payload"]["input"] == [{"role": "user", "content": "hello"}]
+    assert captured["payload"]["reasoning"]["effort"] == "low"
+    assert captured["payload"]["stream"] is True
 
 
 def test_provider_key_reads_all_provider_env_aliases(monkeypatch):
@@ -730,6 +865,131 @@ def test_interactive_output_prints_raw_markdown_when_redirected(monkeypatch):
     assert stdout.getvalue() == "# Title\n\n```python\nprint('hi')\n```\n"
 
 
+def test_response_line_numbers_use_plain_numeric_prefixes():
+    from agentick.cli import response_with_line_numbers
+
+    assert response_with_line_numbers("Example\nEXample") == "1 Example\n2 EXample"
+
+
+def test_render_numbered_response_preserves_markdown_line_breaks():
+    from agentick import cli
+
+    sample = """In Neovim/netrw:
+
+```vim
+let g:netrw_browsex_viewer = "open"
+```
+
+Lua:
+
+```lua
+vim.g.netrw_browsex_viewer = "open"
+```
+
+Then pressing gx on a PDF/path opens it with macOS open.
+
+Or directly:
+
+```vim
+:!open %
+```"""
+
+    rendered = cli.strip_ansi(cli.render_numbered_response_ansi(sample))
+    lines = rendered.splitlines()
+
+    assert lines[0] == " 1 In Neovim/netrw:"
+    assert lines[1] == " 2 "
+    assert lines[3] == ' 4  let g:netrw_browsex_viewer = "open"'
+    assert lines[6] == " 7 Lua:"
+    assert lines[9] == '10  vim.g.netrw_browsex_viewer = "open"'
+    assert lines[12] == "13 Then pressing gx on a PDF/path opens it with macOS open."
+    assert lines[17] == "18  :!open %"
+    assert not any("1 In Neovim/netrw: 2" in line for line in lines)
+
+
+def test_reply_prompt_and_hotkey_overlay_do_not_show_citation_hint(monkeypatch):
+    from agentick import cli
+
+    messages = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}]
+    monkeypatch.setenv("AGC_CONTEXT_LIMIT_TOKENS", "1000")
+
+    overlay = cli.hotkey_overlay_text(messages, "openai", "gpt-4o-mini")
+    assert cli.REPLY_PROMPT == "Reply: "
+    assert "(" not in cli.REPLY_PROMPT and "@cite" not in cli.REPLY_PROMPT
+    assert "citation" not in overlay.lower()
+    assert "@cite" not in overlay
+
+
+def test_reply_mode_slash_commands_cancel_or_open_visual():
+    from agentick import cli
+
+    assert cli.resolve_reply_command("/exit") == ""
+    assert cli.resolve_reply_command(" /exit ") == ""
+    assert cli.resolve_reply_command("/visual") == cli.REPLY_VISUAL_ACTION
+    assert cli.resolve_reply_command("regular reply") is None
+
+    slash = cli.strip_ansi(cli.render_reply_command_suggestions("/"))
+    assert "/exit" in slash
+    assert "/visual" in slash
+    assert "return to the response viewer" in slash
+    assert "multiline reply" in slash
+
+    assert cli.complete_reply_command("/e") == "/exit"
+    assert cli.complete_reply_command("/v") == "/visual"
+    assert cli.complete_reply_command("/unknown") == "/unknown"
+
+
+def test_conversation_footer_shows_top_hotkeys_and_overlay_lists_all_keys(monkeypatch):
+    from agentick import cli
+
+    messages = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}]
+    monkeypatch.setenv("AGC_CONTEXT_LIMIT_TOKENS", "1000")
+
+    footer = cli.conversation_footer(messages, "openai", "gpt-4o-mini", 0, 10, 20, color=False)
+    assert "R reply" in footer
+    assert "C compact" in footer
+    assert "q quit" in footer
+    assert "? all keys" in footer
+    assert "E editor" not in footer
+
+    overlay = cli.hotkey_overlay_text(messages, "openai", "gpt-4o-mini")
+    assert "Agentick hotkeys" in overlay
+    assert "Press ? or q to close" in overlay
+    assert "E / V" in overlay
+    assert "Ctrl-S" in overlay
+    assert "Space / PgDn" in overlay
+
+
+def test_compact_chat_messages_summarizes_older_context_and_keeps_recent(monkeypatch):
+    from agentick import cli
+
+    captured = {}
+
+    def fake_call_ai_messages(task, cfg, messages):
+        captured["task"] = task
+        captured["prompt"] = messages[0]["content"]
+        return "## Goal\nKeep the useful bits."
+
+    monkeypatch.setattr(cli, "call_ai_messages", fake_call_ai_messages)
+    original = [
+        {"role": "system", "content": "Be useful."},
+        {"role": "user", "content": "old user"},
+        {"role": "assistant", "content": "old assistant"},
+        {"role": "user", "content": "recent user"},
+        {"role": "assistant", "content": "recent assistant"},
+    ]
+
+    compacted = cli.compact_chat_messages({"reasoning_effort": "high"}, {"providers": {}}, original)
+
+    assert captured["task"]["reasoning_effort"] == "minimal"
+    assert "OLDER_MESSAGES JSON" in captured["prompt"]
+    assert "old user" in captured["prompt"]
+    assert "RECENT_MESSAGES KEPT VERBATIM" in captured["prompt"]
+    assert compacted[0] == original[0]
+    assert "Compacted conversation summary for continuity" in compacted[1]["content"]
+    assert compacted[-2:] == original[-2:]
+
+
 def test_cite_ranges_extract_previous_response_chunks():
     from agentick.cli import CiteRange, build_cited_reply, extract_citation_chunk, parse_cite_ranges
 
@@ -862,6 +1122,17 @@ Summarize {{arg:0}}
     assert 'param_0: "incident notes pasted from Slack"' in rendered
 
 
+def test_editor_reply_template_parses_multiline_reply():
+    from agentick import cli
+
+    initial = cli.reply_editor_initial("First line\nSecond line")
+
+    assert "@cite:L1C1..L2C5" in initial
+    assert "#   1 First line" in initial
+    reply = cli.parse_reply_editor_value(initial + "Please expand this.\nWith details.\n")
+    assert reply == "Please expand this.\nWith details."
+
+
 def test_task_runs_save_execution_history_and_history_view(tmp_path: Path):
     home = tmp_path / "home"
     env = {
@@ -906,6 +1177,88 @@ def test_task_runs_save_execution_history_and_history_view(tmp_path: Path):
     assert viewed.returncode == 0, viewed.stderr
     assert "# Agentick run: js-explain" in viewed.stdout
     assert "## Usage" in viewed.stdout
+
+    chat_files = sorted((home / "conversations" / "history" / "js-explain").glob("*.md"))
+    assert len(chat_files) == 2
+    assert any("# Agentick chat: js-explain" in path.read_text() for path in chat_files)
+    assert any("Explain Map" in path.read_text() and "first answer" in path.read_text() for path in chat_files)
+    assert any("Explain Set" in path.read_text() and "second answer" in path.read_text() for path in chat_files)
+
+    chats = run_agc("chats", "js-explain", env={"AGENTICK_HOME": str(home)})
+    assert chats.returncode == 0, chats.stderr
+    assert "Chat sessions" in chats.stdout
+    assert "js-explain" in chats.stdout
+    session_id = chat_files[0].stem
+    chat_view = run_agc("chats", "view", "js-explain", session_id, "--headless", env={"AGENTICK_HOME": str(home)})
+    assert chat_view.returncode == 0, chat_view.stderr
+    assert "# Agentick chat: js-explain" in chat_view.stdout
+    assert f"Session id: `{session_id}`" in chat_view.stdout
+
+    resumed = run_agc(
+        "chats", "resume", "js-explain", session_id,
+        "--reply", "Please continue from here.",
+        "--headless",
+        env={"AGENTICK_HOME": str(home), "AGC_MOCK_RESPONSE": "resumed answer", "AGC_CONTEXT_LIMIT_TOKENS": "10"},
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    assert "resumed answer" in resumed.stdout
+    assert "agc warning: Context" in resumed.stderr
+    assert "compact soon" in resumed.stderr
+    resumed_markdown = (home / "conversations" / "history" / "js-explain" / f"{session_id}.md").read_text()
+    assert "Please continue from here." in resumed_markdown
+    assert "resumed answer" in resumed_markdown
+    resumed_json = json.loads((home / "conversations" / "history" / "js-explain" / f"{session_id}.json").read_text())
+    assert resumed_json["session_id"] == session_id
+    assert resumed_json["messages"][-2]["content"] == "Please continue from here."
+    assert resumed_json["messages"][-1]["content"] == "resumed answer"
+
+    context = run_agc("chats", "context", "js-explain", session_id, "--headless", env={"AGENTICK_HOME": str(home), "AGC_CONTEXT_LIMIT_TOKENS": "10"})
+    assert context.returncode == 0, context.stderr
+    assert "# Agentick chat context: js-explain" in context.stdout
+    assert "Estimated input context tokens" in context.stdout
+    assert "Estimated context used" in context.stdout
+    assert "Warning: context is at or above 50%" in context.stdout
+
+    compacted = run_agc("chats", "compact", "js-explain", session_id, env={"AGENTICK_HOME": str(home), "AGC_MOCK_RESPONSE": "compact summary", "AGC_CONTEXT_LIMIT_TOKENS": "10"})
+    assert compacted.returncode == 0, compacted.stderr
+    assert "Compacted chat session" in compacted.stdout
+    assert "Before: Context" in compacted.stdout
+    assert "After:  Context" in compacted.stdout
+    compacted_json = json.loads((home / "conversations" / "history" / "js-explain" / f"{session_id}.json").read_text())
+    assert any("Compacted conversation summary for continuity" in message["content"] for message in compacted_json["messages"])
+    assert any("compact summary" in message["content"] for message in compacted_json["messages"])
+
+    reset = run_agc("chats", "reset", "js-explain", session_id, "--yes", env={"AGENTICK_HOME": str(home)})
+    assert reset.returncode == 0, reset.stderr
+    assert f"Reset chat context: js-explain {session_id}" in reset.stdout
+    assert not (home / "conversations" / "history" / "js-explain" / f"{session_id}.md").exists()
+    assert not (home / "conversations" / "history" / "js-explain" / f"{session_id}.json").exists()
+
+
+def test_run_task_no_context_skips_chat_persistence(tmp_path: Path):
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(json.dumps({
+        "default_provider": "openai",
+        "providers": {"openai": {"api_key": "test-key", "model": "gpt-4o-mini"}},
+    }))
+    task_dir = home / "tasks"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "js-explain.json").write_text(json.dumps({
+        "name": "js-explain",
+        "provider": "openai",
+        "user_prompt": "Explain {{arg:0}}",
+    }))
+
+    proc = run_agc(
+        "js-explain", "Map", "--headless", "--no-context",
+        env={"AGENTICK_HOME": str(home), "AGC_MOCK_RESPONSE": "answer"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "answer" in proc.stdout
+    assert (home / "runs" / "js-explain.md").exists()
+    assert not (home / "conversations" / "history" / "js-explain").exists()
 
 
 def test_tasks_list_saved_tasks_with_agent_and_routine_labels():
