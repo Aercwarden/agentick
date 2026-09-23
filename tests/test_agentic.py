@@ -6,14 +6,24 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
-ENV = os.environ.copy()
-ENV["PYTHONPATH"] = str(ROOT / "src")
-ENV["AGENTICK_HOME"] = str(ROOT / ".test-agentick-agent-home")
+
+
+@pytest.fixture(autouse=True)
+def isolated_agentick_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AGENTICK_HOME", str(tmp_path / "agentick-home"))
+    monkeypatch.setenv("PYTHONPATH", str(ROOT / "src"))
+
+
+def agentick_home() -> Path:
+    return Path(os.environ["AGENTICK_HOME"])
 
 
 def run_agc(*args: str, env: dict[str, str] | None = None):
-    merged = ENV.copy()
+    merged = os.environ.copy()
+    merged["PYTHONPATH"] = str(ROOT / "src")
     if env:
         merged.update(env)
     return subprocess.run(
@@ -27,7 +37,7 @@ def run_agc(*args: str, env: dict[str, str] | None = None):
 
 
 def seed_config() -> None:
-    home = ROOT / ".test-agentick-agent-home"
+    home = agentick_home()
     home.mkdir(parents=True, exist_ok=True)
     for transient in (home / "mock_agent_index.txt", home / "last_agent_trace.json"):
         if transient.exists():
@@ -56,7 +66,7 @@ def test_new_can_save_agentic_task_from_frontmatter(tmp_path: Path):
     proc = run_agc("new", str(prompt), "repo-agent", "--no-interactive")
 
     assert proc.returncode == 0, proc.stderr
-    task = json.loads((ROOT / ".test-agentick-agent-home" / "tasks" / "repo-agent.json").read_text())
+    task = json.loads((agentick_home() / "tasks" / "repo-agent.json").read_text())
     assert task["agent"] is True
 
 
@@ -65,7 +75,7 @@ def test_agentic_task_runs_tool_loop_and_writes_trace(tmp_path: Path):
     target = ROOT / "agentic-smoke.txt"
     if target.exists():
         target.unlink()
-    task_dir = ROOT / ".test-agentick-agent-home" / "tasks"
+    task_dir = agentick_home() / "tasks"
     (task_dir / "make-file.json").write_text(json.dumps({
         "name": "make-file",
         "provider": "openai",
@@ -88,9 +98,9 @@ def test_agentic_task_runs_tool_loop_and_writes_trace(tmp_path: Path):
     assert proc.returncode == 0, proc.stderr
     assert "Created agentic-smoke.txt" in proc.stdout
     assert target.read_text(encoding="utf-8") == "hello from agent\n"
-    trace = ROOT / ".test-agentick-agent-home" / "last_agent_trace.json"
+    trace = agentick_home() / "last_agent_trace.json"
     assert "write_file" in trace.read_text(encoding="utf-8")
-    log = ROOT / ".test-agentick-agent-home" / "runs" / "make-file.md"
+    log = agentick_home() / "runs" / "make-file.md"
     assert "Created agentic-smoke.txt" in log.read_text(encoding="utf-8")
     assert "write_file" in log.read_text(encoding="utf-8")
     target.unlink()
@@ -98,7 +108,7 @@ def test_agentic_task_runs_tool_loop_and_writes_trace(tmp_path: Path):
 
 def test_agentic_write_requires_explicit_permission():
     seed_config()
-    task_dir = ROOT / ".test-agentick-agent-home" / "tasks"
+    task_dir = agentick_home() / "tasks"
     (task_dir / "blocked-write.json").write_text(json.dumps({
         "name": "blocked-write",
         "provider": "openai",
@@ -113,14 +123,14 @@ def test_agentic_write_requires_explicit_permission():
     proc = run_agc("blocked-write", "--headless", env={"AGC_MOCK_AGENT_RESPONSES": json.dumps(responses)})
 
     assert proc.returncode == 0, proc.stderr
-    trace = json.loads((ROOT / ".test-agentick-agent-home" / "last_agent_trace.json").read_text())
+    trace = json.loads((agentick_home() / "last_agent_trace.json").read_text())
     assert "requires --allow-write" in trace[1]["observation"]
     assert not (ROOT / "blocked.txt").exists()
 
 
 def test_agentic_curl_requires_explicit_network_permission():
     seed_config()
-    task_dir = ROOT / ".test-agentick-agent-home" / "tasks"
+    task_dir = agentick_home() / "tasks"
     (task_dir / "blocked-curl.json").write_text(json.dumps({
         "name": "blocked-curl",
         "provider": "openai",
@@ -135,13 +145,13 @@ def test_agentic_curl_requires_explicit_network_permission():
     proc = run_agc("blocked-curl", "--headless", env={"AGC_MOCK_AGENT_RESPONSES": json.dumps(responses)})
 
     assert proc.returncode == 0, proc.stderr
-    trace = json.loads((ROOT / ".test-agentick-agent-home" / "last_agent_trace.json").read_text())
+    trace = json.loads((agentick_home() / "last_agent_trace.json").read_text())
     assert "requires --allow-net" in trace[1]["observation"]
 
 
 def test_routines_view_prints_last_agentic_run_log_headlessly():
     seed_config()
-    run_dir = ROOT / ".test-agentick-agent-home" / "runs"
+    run_dir = agentick_home() / "runs"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "branch-watch.md").write_text("# Agentick run: branch-watch\n\nprepared branch ready\n", encoding="utf-8")
 
@@ -153,7 +163,7 @@ def test_routines_view_prints_last_agentic_run_log_headlessly():
 
 def test_routines_list_shows_agent_and_view_hint():
     seed_config()
-    task_dir = ROOT / ".test-agentick-agent-home" / "tasks"
+    task_dir = agentick_home() / "tasks"
     (task_dir / "branch-watch.json").write_text(json.dumps({
         "name": "branch-watch",
         "provider": "openai",
@@ -174,7 +184,7 @@ def test_routines_list_shows_agent_and_view_hint():
 
 def test_routines_create_prompts_for_schedule_metadata_and_writes_launchd_artifacts():
     seed_config()
-    task_dir = ROOT / ".test-agentick-agent-home" / "tasks"
+    task_dir = agentick_home() / "tasks"
     (task_dir / "branch-watch.json").write_text(json.dumps({
         "name": "branch-watch",
         "provider": "openai",
@@ -205,8 +215,8 @@ def test_routines_create_prompts_for_schedule_metadata_and_writes_launchd_artifa
     assert routine["permissions"]["agent"] is True
     assert routine["permissions"]["allow_shell"] is True
     assert routine["permissions"]["allow_net"] is True
-    plist = ROOT / ".test-agentick-agent-home" / "routines" / "branch-watch.plist"
-    script = ROOT / ".test-agentick-agent-home" / "routines" / "branch-watch.sh"
+    plist = agentick_home() / "routines" / "branch-watch.plist"
+    script = agentick_home() / "routines" / "branch-watch.sh"
     assert "StartInterval" in plist.read_text(encoding="utf-8")
     assert "900" in plist.read_text(encoding="utf-8")
     assert "--allow-shell" in script.read_text(encoding="utf-8")
@@ -215,7 +225,7 @@ def test_routines_create_prompts_for_schedule_metadata_and_writes_launchd_artifa
 
 def test_routines_create_can_write_cron_artifact_on_linux_style_scheduler():
     seed_config()
-    task_dir = ROOT / ".test-agentick-agent-home" / "tasks"
+    task_dir = agentick_home() / "tasks"
     (task_dir / "daily-report.json").write_text(json.dumps({
         "name": "daily-report",
         "provider": "openai",
@@ -225,14 +235,14 @@ def test_routines_create_can_write_cron_artifact_on_linux_style_scheduler():
     proc = run_agc("routines", "create", "daily-report", "--every", "2h", "--scheduler", "cron", "--no-install", "--no-interactive")
 
     assert proc.returncode == 0, proc.stderr
-    cron = ROOT / ".test-agentick-agent-home" / "routines" / "daily-report.cron"
+    cron = agentick_home() / "routines" / "daily-report.cron"
     assert cron.exists()
     assert "0 */2 * * *" in cron.read_text(encoding="utf-8")
 
 
 def test_routines_edit_stop_and_delete_update_saved_routine_without_touching_os_scheduler():
     seed_config()
-    task_dir = ROOT / ".test-agentick-agent-home" / "tasks"
+    task_dir = agentick_home() / "tasks"
     (task_dir / "branch-watch.json").write_text(json.dumps({
         "name": "branch-watch",
         "provider": "openai",

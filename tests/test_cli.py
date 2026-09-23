@@ -944,6 +944,66 @@ def test_reply_mode_slash_commands_cancel_or_open_visual():
     assert "Tab completes slash commands" in hint
 
 
+def test_reply_file_completion_and_injection(tmp_path):
+    from agentick import cli
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "cli.py").write_text("print('hello')", encoding="utf-8")
+        (tmp_path / "README.md").write_text("documentation", encoding="utf-8")
+        
+        matches = cli._reply_file_completer("@")
+        assert "@README.md " in matches
+        assert "@src/" in matches
+        
+        matches_prefix = cli._reply_file_completer("@R")
+        assert matches_prefix == ["@README.md "]
+        
+        matches_sub = cli._reply_file_completer("@src/")
+        assert matches_sub == ["@src/cli.py "]
+        
+        assert cli._reply_command_completer("@R", 0) == "@README.md "
+        
+        reply = "Please review @README.md and check @src/cli.py."
+        injected = cli.inject_referenced_files(reply)
+        assert "Please review @README.md and check @src/cli.py." in injected
+        assert "--- File: README.md ---" in injected
+        assert "documentation" in injected
+        assert "--- File: src/cli.py ---" in injected
+        assert "print('hello')" in injected
+        
+        assert cli.inject_referenced_files("Check @missing.py") == "Check @missing.py"
+    finally:
+        os.chdir(cwd)
+
+
+def test_format_and_parse_chat_for_editing():
+    from agentick import cli
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "user query"},
+        {"role": "assistant", "content": "assistant response"}
+    ]
+    formatted = cli.format_chat_for_editing(messages)
+    assert "## System" in formatted
+    assert "system prompt" in formatted
+    assert "## User" in formatted
+    assert "user query" in formatted
+    assert "## Assistant" in formatted
+    assert "assistant response" in formatted
+    
+    parsed = cli.parse_edited_chat(formatted)
+    assert parsed == messages
+    
+    invalid_formatted = "## System\nsys\n## InvalidRole\ncontent"
+    parsed_invalid = cli.parse_edited_chat(invalid_formatted)
+    assert parsed_invalid == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "content"}
+    ]
+
+
 def test_reply_prompt_uses_terminal_line_editor_for_arrow_cursor_editing():
     if os.name == "nt":
         return

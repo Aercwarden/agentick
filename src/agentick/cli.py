@@ -2472,11 +2472,12 @@ def with_loader(message: str, func: Callable[[], T]) -> T:
     def spin() -> None:
         idx = 0
         while not done.is_set():
-            elapsed = int(time.monotonic() - started)
-            sys.stderr.write(f"\r{CYAN}{frames[idx % len(frames)]}{RESET} {message} {DIM}{elapsed}s{RESET}")
+            elapsed = time.monotonic() - started
+            color = (CYAN, MAGENTA, YELLOW)[(idx // 2) % 3]
+            sys.stderr.write(f"\r\x1b[K{color}{frames[idx % len(frames)]}{RESET} {BOLD}{message}{RESET} {DIM}{elapsed:.1f}s{RESET}")
             sys.stderr.flush()
             idx += 1
-            done.wait(0.12)
+            done.wait(0.08)
 
     thread = threading.Thread(target=spin, daemon=True)
     thread.start()
@@ -2485,8 +2486,8 @@ def with_loader(message: str, func: Callable[[], T]) -> T:
     finally:
         done.set()
         thread.join(timeout=0.3)
-        elapsed = int(time.monotonic() - started)
-        sys.stderr.write(f"\r{GREEN}✓{RESET} {message} {DIM}{elapsed}s{RESET}\n")
+        elapsed = time.monotonic() - started
+        sys.stderr.write(f"\r\x1b[K{GREEN}✓{RESET} {BOLD}{message}{RESET} {DIM}{elapsed:.1f}s{RESET}\n")
         sys.stderr.flush()
 
 
@@ -2534,17 +2535,114 @@ def extract_citation_chunk(response: str, cite: CiteRange) -> str:
         else:
             chunks.append(line)
     return "\n".join(chunks)
+def format_chat_for_editing(messages: list[dict[str, str]]) -> str:
+    lines = [
+        "# Agentick Chat Editor",
+        "# Edit the messages below. You can edit the text, change roles, delete sections,",
+        "# or reorder sections. Each message starts with a '## <Role>' header.",
+        "# Supported roles: System, User, Assistant",
+        "# Lines starting with '#' at the top are ignored.",
+        ""
+    ]
+    for message in messages:
+        role = str(message.get("role", "user")).title()
+        content = str(message.get("content", ""))
+        lines.append(f"## {role}")
+        lines.append(content)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def parse_edited_chat(text: str) -> list[dict[str, str]]:
+    lines = text.splitlines()
+    while lines and (lines[0].strip().startswith("# ") or lines[0].strip() == "#"):
+        lines.pop(0)
+        
+    messages: list[dict[str, str]] = []
+    current_role: str | None = None
+    current_content: list[str] = []
+    
+    for line in lines:
+        if line.startswith("## "):
+            if current_role is not None:
+                messages.append({
+                    "role": current_role.lower(),
+                    "content": "\n".join(current_content).strip()
+                })
+                current_content = []
+            role_candidate = line[3:].strip().lower()
+            if role_candidate in {"system", "user", "assistant"}:
+                current_role = role_candidate
+            else:
+                current_role = "user"
+        else:
+            if current_role is not None:
+                current_content.append(line)
+                
+    if current_role is not None:
+        messages.append({
+            "role": current_role.lower(),
+            "content": "\n".join(current_content).strip()
+        })
+    return messages
+
+
+def edit_chat_context_interactive(messages: list[dict[str, str]], *, old_settings: list[Any] | None = None) -> list[dict[str, str]] | None:
+    fd = sys.stdin.fileno()
+    if old_settings is not None:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    try:
+        sys.stdout.write("\x1b[?25h\nOpening $VISUAL/$EDITOR to edit chat context…\n")
+        sys.stdout.flush()
+        initial_text = format_chat_for_editing(messages)
+        edited_text = open_editor(initial_text)
+        if not edited_text.strip():
+            return None
+        return parse_edited_chat(edited_text)
+    finally:
+        if old_settings is not None:
+            tty.setcbreak(fd)
+
+
+def inject_referenced_files(reply: str) -> str:
+    words = reply.split()
+    referenced_files = []
+    
+    for word in words:
+        if word.startswith("@") and not word.startswith("@cite:"):
+            # Strip trailing punctuation commonly typed after a file name
+            clean_path = word[1:].rstrip("?.!,:;")
+            if not clean_path:
+                continue
+            path = Path(clean_path).expanduser()
+            if path.exists() and path.is_file():
+                referenced_files.append((clean_path, path))
+                
+    if not referenced_files:
+        return reply
+        
+    injected = [reply, ""]
+    for clean_path, path in referenced_files:
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+            injected.append(f"--- File: {clean_path} ---")
+            injected.append(content)
+            injected.append("--- End of File ---")
+        except Exception as exc:
+            injected.append(f"--- File: {clean_path} (Error reading file: {exc}) ---")
+            
+    return "\n".join(injected)
 
 
 def build_cited_reply(reply: str, previous_response: str) -> str:
     ranges = parse_cite_ranges(reply)
     if not ranges:
-        return reply
+        return inject_referenced_files(reply)
     blocks = []
     for cite in ranges:
         chunk = extract_citation_chunk(previous_response, cite)
         blocks.append(f"Citation {cite.token} from the previous assistant response:\n```text\n{chunk}\n```")
-    return reply + "\n\n" + "\n\n".join(blocks)
+    return inject_referenced_files(reply + "\n\n" + "\n\n".join(blocks))
 
 
 def response_with_line_numbers(response: str) -> str:
@@ -2671,6 +2769,7 @@ def warn_context_if_needed(messages: list[dict[str, str]], provider: str, model:
 
 
 COMPACT_ACTION = "__AGENTICK_COMPACT__"
+EDIT_CONTEXT_ACTION = "__AGENTICK_EDIT_CONTEXT__"
 REPLY_VISUAL_ACTION = "__AGENTICK_VISUAL_REPLY__"
 REPLY_PROMPT = "Reply: "
 REPLY_COMMANDS: list[tuple[str, str]] = [
@@ -2802,10 +2901,43 @@ def resolve_reply_command(text: str) -> str | None:
         return REPLY_VISUAL_ACTION
     return None
 
+def _reply_file_completer(text: str) -> list[str]:
+    if not text.startswith("@"):
+        return []
+    path_str = text[1:]
+    try:
+        if "/" in path_str:
+            dirname, prefix = path_str.rsplit("/", 1)
+            search_dir = Path(dirname)
+        else:
+            dirname, prefix = "", path_str
+            search_dir = Path(".")
+            
+        if not search_dir.exists() or not search_dir.is_dir():
+            return []
+            
+        matches = []
+        for entry in search_dir.iterdir():
+            name = entry.name
+            if name.startswith(prefix):
+                if name.startswith(".") and not prefix.startswith("."):
+                    continue
+                rel_path = f"{dirname}/{name}" if dirname else name
+                if entry.is_dir():
+                    matches.append(f"@{rel_path}/")
+                else:
+                    matches.append(f"@{rel_path} ")
+        return matches
+    except Exception:
+        return []
+
 
 def _reply_command_completer(text: str, state: int) -> str | None:
-    """Readline completer for reply-mode slash commands."""
-    matches = [command + " " for command, _description in REPLY_COMMANDS if command.startswith(text)]
+    """Readline completer for reply-mode slash commands and @file completions."""
+    if text.startswith("@"):
+        matches = _reply_file_completer(text)
+    else:
+        matches = [command + " " for command, _description in REPLY_COMMANDS if command.startswith(text)]
     if state < len(matches):
         return matches[state]
     return None
@@ -2918,6 +3050,8 @@ PAGER_HOTKEYS: list[tuple[str, str]] = [
     ("?", "show/close all hotkeys"),
     ("E / V", "open $VISUAL/$EDITOR for multiline reply"),
     ("Ctrl-S", "save conversation transcript"),
+    ("[", "previous chat message/turn"),
+    ("]", "next chat message/turn"),
     ("j / ↓ / Enter", "scroll down"),
     ("k / h / ↑", "scroll up"),
     ("Space / PgDn", "page down"),
@@ -2927,10 +3061,11 @@ PAGER_HOTKEYS: list[tuple[str, str]] = [
 ]
 
 
-def conversation_footer(messages: list[dict[str, str]], provider: str, model: str, top: int, body_height: int, total_lines: int, *, color: bool = True) -> str:
+def conversation_footer(messages: list[dict[str, str]], provider: str, model: str, top: int, body_height: int, total_lines: int, *, color: bool = True, turn_info: str = "") -> str:
     context_bits = format_context_status(messages, provider, model, color=color) if provider and model else "Context unknown"
     end = min(top + body_height, total_lines)
-    return f"{DIM}R reply · C compact · q quit · ? all keys · {context_bits} · {top + 1}-{end}/{total_lines}{RESET}"
+    turn_str = f" {turn_info} ·" if turn_info else ""
+    return f"{DIM}R reply ·{turn_str} C compact · q quit · ? all keys · {context_bits} · {top + 1}-{end}/{total_lines}{RESET}"
 
 
 def hotkey_overlay_text(messages: list[dict[str, str]], provider: str, model: str) -> str:
@@ -2959,7 +3094,12 @@ def render_hotkey_overlay(messages: list[dict[str, str]], provider: str, model: 
 def conversation_pager(response: str, messages: list[dict[str, str]], *, provider: str = "", model: str = "") -> str | None:
     if os.environ.get("AGC_NO_PAGER") or not sys.stdin.isatty() or not sys.stdout.isatty():
         return None
-    rendered = render_numbered_response_ansi(response)
+
+    assistant_indices = [i for i, msg in enumerate(messages) if msg["role"] == "assistant"]
+    current_idx = len(assistant_indices) - 1 if assistant_indices else -1
+
+    current_response = response
+    rendered = render_numbered_response_ansi(current_response)
     lines = rendered.splitlines() or [""]
     top = 0
     fd = sys.stdin.fileno()
@@ -2975,11 +3115,23 @@ def conversation_pager(response: str, messages: list[dict[str, str]], *, provide
             sys.stdout.write(render_hotkey_overlay(messages, provider, model, size.columns, size.lines))
             sys.stdout.flush()
             return
+
+        # Compute the subset of messages up to current_idx for context meter status
+        if assistant_indices and current_idx >= 0:
+            msg_idx = assistant_indices[current_idx]
+            visible_messages = messages[:msg_idx + 1]
+        else:
+            visible_messages = messages
+
+        turn_info = ""
+        if assistant_indices and len(assistant_indices) > 1:
+            turn_info = f"Turn {current_idx + 1}/{len(assistant_indices)}"
+
         body_height = max(1, size.lines - 2)
         max_top = max(0, len(lines) - body_height)
         top = max(0, min(top, max_top))
         visible = lines[top : top + body_height]
-        footer = conversation_footer(messages, provider, model, top, body_height, len(lines), color=True)
+        footer = conversation_footer(visible_messages, provider, model, top, body_height, len(lines), color=True, turn_info=turn_info)
         sys.stdout.write("\x1b[?25l\x1b[H\x1b[2J")
         sys.stdout.write("\n".join(visible))
         if visible:
@@ -3007,27 +3159,48 @@ def conversation_pager(response: str, messages: list[dict[str, str]], *, provide
             elif key in {"q", "Q", "\x03"}:
                 return None
             if key in {"R", "r"}:
-                reply = _prompt_line(REPLY_PROMPT, previous_response=response, old_settings=old_settings).strip()
+                reply = _prompt_line(REPLY_PROMPT, previous_response=current_response, old_settings=old_settings).strip()
                 if reply == REPLY_VISUAL_ACTION:
-                    reply = _prompt_editor_reply(response, old_settings=old_settings).strip()
+                    reply = _prompt_editor_reply(current_response, old_settings=old_settings).strip()
                 if reply:
+                    if assistant_indices and current_idx >= 0:
+                        msg_idx = assistant_indices[current_idx]
+                        del messages[msg_idx + 1:]
                     return reply
                 status = f"{YELLOW}Reply cancelled.{RESET}"
             elif key in {"E", "e", "V", "v"}:
-                reply = _prompt_editor_reply(response, old_settings=old_settings).strip()
+                reply = _prompt_editor_reply(current_response, old_settings=old_settings).strip()
                 if reply:
+                    if assistant_indices and current_idx >= 0:
+                        msg_idx = assistant_indices[current_idx]
+                        del messages[msg_idx + 1:]
                     return reply
                 status = f"{YELLOW}Empty editor reply cancelled.{RESET}"
             elif key in {"C", "c"}:
+                if assistant_indices and current_idx >= 0:
+                    msg_idx = assistant_indices[current_idx]
+                    del messages[msg_idx + 1:]
                 return COMPACT_ACTION
             elif key == "\x13":
                 name = _prompt_line("Save conversation as: ", old_settings=old_settings).strip()
                 if name:
                     try:
-                        out = save_conversation(name, messages)
+                        if assistant_indices and current_idx >= 0:
+                            msg_idx = assistant_indices[current_idx]
+                            to_save = messages[:msg_idx + 1]
+                        else:
+                            to_save = messages
+                        out = save_conversation(name, to_save)
                         status = f"{GREEN}Saved conversation:{RESET} {out}"
                     except ValueError as exc:
                         status = f"{RED}{exc}{RESET}"
+            elif key in {"U", "u"}:
+                parsed = edit_chat_context_interactive(messages, old_settings=old_settings)
+                if parsed:
+                    messages.clear()
+                    messages.extend(parsed)
+                    return EDIT_CONTEXT_ACTION
+                status = f"{YELLOW}Context edit cancelled (empty or no changes).{RESET}"
             elif key in {"h", "k", "\x1b[A"}:
                 top -= 1
             elif key in {"j", "\x1b[B", "\r", "\n"}:
@@ -3036,6 +3209,20 @@ def conversation_pager(response: str, messages: list[dict[str, str]], *, provide
                 top += page
             elif key in {"b", "\x02", "\x1b[5~"}:
                 top -= page
+            elif key == "[":
+                if assistant_indices and current_idx > 0:
+                    current_idx -= 1
+                    current_response = messages[assistant_indices[current_idx]]["content"]
+                    rendered = render_numbered_response_ansi(current_response)
+                    lines = rendered.splitlines() or [""]
+                    top = 0
+            elif key == "]":
+                if assistant_indices and current_idx < len(assistant_indices) - 1:
+                    current_idx += 1
+                    current_response = messages[assistant_indices[current_idx]]["content"]
+                    rendered = render_numbered_response_ansi(current_response)
+                    lines = rendered.splitlines() or [""]
+                    top = 0
             elif key == "g":
                 top = 0
             elif key == "G":
@@ -3159,6 +3346,11 @@ def conversation_loop(task_name: str, task: dict[str, Any], cfg: dict[str, Any],
             except (RuntimeError, ValueError, urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, urllib.error.HTTPError) as exc:
                 print(f"agc error: {exc}", file=sys.stderr)
                 return
+            continue
+        if reply == EDIT_CONTEXT_ACTION:
+            if persist_context:
+                save_chat_session(task_name, session_id, messages)
+            response = last_assistant_response(messages) or ""
             continue
         try:
             user_content = build_cited_reply(reply, response)
@@ -3453,6 +3645,10 @@ def resume_chat_cmd(name: str, session_id: str | None, args: argparse.Namespace)
             except (RuntimeError, ValueError, urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, urllib.error.HTTPError) as exc:
                 print(f"agc error: {exc}", file=sys.stderr)
                 return 1
+            continue
+        if reply == EDIT_CONTEXT_ACTION:
+            save_chat_session(name, selected_id, messages)
+            response = last_assistant_response(messages) or ""
             continue
         try:
             user_content = build_cited_reply(reply, response)
