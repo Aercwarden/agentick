@@ -259,14 +259,35 @@ agc setup
 
 ### Development install
 
+Use [uv](https://docs.astral.sh/uv/getting-started/installation/) 0.13.5 or
+newer. The project pins Python 3.14.9 in `.python-version`; uv can download it
+without replacing your system Python. `uv.lock` records the development and
+runtime dependency versions and distribution hashes.
+
 ```bash
 git clone <your-agentick-repo-url>
 cd agentick
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e '.[dev]'
-python -m pytest
+uv sync --locked --extra dev
+uv run --locked --extra dev python -m pytest
+uv run --locked --extra dev python -m pip_audit --local --skip-editable
 ```
+
+To update dependencies deliberately, run `uv lock --upgrade`, then repeat the
+sync, tests, and audit commands above. Build release files with
+`uv run --locked --extra dev python -m build --no-isolation` so the build uses
+the locked build dependencies.
+
+GitHub Actions runs tests on Python 3.11–3.14, builds distributions, and checks
+installed dependencies for known vulnerabilities on pushes, pull requests,
+and a weekly schedule. Dependabot proposes weekly Python and GitHub Actions
+updates. These checks become active when the configuration is pushed to GitHub.
+
+The pip-based installers remain available without uv. Rerun the installer to
+upgrade an existing installation and its dependencies. Each installer first
+bootstraps a hash-verified pip with the emSign certificate fix when needed,
+then upgrades pip and Agentick's dependencies. Updating `certifi` alone does not update
+pip's bundled certificate store. Use a Python interpreter with current
+security patches; the installer does not replace your system Python.
 
 ## First setup
 
