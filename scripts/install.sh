@@ -109,8 +109,11 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1 && [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 run "$PYTHON_BIN" -m venv "$PREFIX"
-run "$BIN_DIR/python" -m pip install --upgrade pip
-run "$BIN_DIR/python" -m pip install -e "$PROJECT_ROOT"
+if [[ "$DRY_RUN" -eq 1 ]] || ! "$BIN_DIR/python" -c 'from importlib.metadata import version; from pip._vendor.packaging.version import Version; import sys; sys.exit(Version(version("pip")) < Version("26.2.2"))'; then
+  run "$BIN_DIR/python" -m pip install --upgrade --require-hashes --only-binary=:all: -r "$PROJECT_ROOT/scripts/bootstrap-requirements.txt"
+fi
+run "$BIN_DIR/python" -m pip install --upgrade "pip>=26.2.2"
+run "$BIN_DIR/python" -m pip install --upgrade --upgrade-strategy eager -e "$PROJECT_ROOT"
 
 detect_profile() {
   local shell_name

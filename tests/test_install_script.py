@@ -93,3 +93,27 @@ def test_install_script_can_skip_shell_profile_update(tmp_path: Path):
     assert proc.returncode == 0, proc.stderr
     assert not (home / ".zshrc").exists()
     assert "Skipping shell profile update" in proc.stdout
+
+
+def test_reinstall_upgrades_an_existing_vulnerable_dependency(tmp_path: Path):
+    prefix = tmp_path / "agentick-install"
+    subprocess.run([sys.executable, "-m", "venv", str(prefix)], check=True)
+    python = prefix / "bin" / "python"
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "certifi==2026.5.20"],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+    proc = run_install("--prefix", str(prefix), "--python", sys.executable, "--no-shell-profile")
+
+    assert proc.returncode == 0, proc.stderr
+    check = subprocess.run(
+        [str(python), "-c", (
+            "from importlib.metadata import version; "
+            "from pip._vendor.packaging.version import Version; "
+            "assert Version(version('certifi')) >= Version('2026.10.23'); "
+            "assert Version(version('pip')) >= Version('26.2.2')"
+        )],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    assert check.returncode == 0, check.stderr

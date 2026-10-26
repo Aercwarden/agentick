@@ -33,8 +33,16 @@ $pythonCmd = Get-Command $Python -ErrorAction SilentlyContinue
 if (-not $pythonCmd) { throw "Python executable not found: $Python" }
 
 Run $Python @("-m", "venv", $Prefix)
-Run (Join-Path $BinDir "python.exe") @("-m", "pip", "install", "--upgrade", "pip")
-Run (Join-Path $BinDir "python.exe") @("-m", "pip", "install", "-e", $ProjectRoot)
+$needsBootstrap = $true
+if (-not $DryRun) {
+    & (Join-Path $BinDir "python.exe") -c 'from importlib.metadata import version; from pip._vendor.packaging.version import Version; import sys; sys.exit(Version(version("pip")) < Version("26.2.2"))'
+    $needsBootstrap = $LASTEXITCODE -ne 0
+}
+if ($needsBootstrap) {
+    Run (Join-Path $BinDir "python.exe") @("-m", "pip", "install", "--upgrade", "--require-hashes", "--only-binary=:all:", "-r", (Join-Path $ProjectRoot "scripts/bootstrap-requirements.txt"))
+}
+Run (Join-Path $BinDir "python.exe") @("-m", "pip", "install", "--upgrade", "pip>=26.2.2")
+Run (Join-Path $BinDir "python.exe") @("-m", "pip", "install", "--upgrade", "--upgrade-strategy", "eager", "-e", $ProjectRoot)
 
 if (-not $NoUserPath -and -not $DryRun) {
     $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
