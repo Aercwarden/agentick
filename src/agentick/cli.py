@@ -2955,11 +2955,13 @@ class _ReplyReadlineSession:
         self.previous_delims = readline.get_completer_delims()
         readline.set_completer_delims(" \t\n")
         readline.set_completer(_reply_command_completer)
-        # GNU readline uses this form; macOS commonly uses libedit and accepts
-        # the second binding. Keep both so Tab completes slash commands without
-        # breaking normal arrow/Home/End editing.
-        readline.parse_and_bind("tab: complete")
-        readline.parse_and_bind("bind ^I rl_complete")
+        # GNU Readline treats libedit's "bind ..." syntax as a binding for b.
+        # Python 3.11–3.12 identify libedit through the module docstring.
+        backend = getattr(readline, "backend", None)
+        if backend == "editline" or (backend is None and "libedit" in (readline.__doc__ or "")):
+            readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            readline.parse_and_bind("tab: complete")
         return readline
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:

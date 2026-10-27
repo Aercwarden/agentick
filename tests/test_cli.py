@@ -11,6 +11,8 @@ from email.message import Message
 from io import BytesIO, StringIO
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 ENV = os.environ.copy()
 ENV["PYTHONPATH"] = str(ROOT / "src")
@@ -1004,12 +1006,16 @@ def test_format_and_parse_chat_for_editing():
     ]
 
 
-def test_reply_prompt_uses_terminal_line_editor_for_arrow_cursor_editing():
+@pytest.mark.parametrize(("keystrokes", "expected_reply"), [
+    (b"abc\x1b[D\x1b[DX\r", "aXbc"),
+    (b"/e\t\r", ""),
+])
+def test_reply_prompt_supports_terminal_editing_and_completion(keystrokes, expected_reply):
     if os.name == "nt":
         return
+    import errno
     import pty
     import select
-    import signal
     import time
 
     code = (
@@ -1025,34 +1031,39 @@ def test_reply_prompt_uses_terminal_line_editor_for_arrow_cursor_editing():
         stdin=slave,
         stdout=slave,
         stderr=slave,
+        env={**os.environ, "TERM": "xterm-256color", "INPUTRC": os.devnull},
     )
     os.close(slave)
     output = b""
     sent = False
-    deadline = time.time() + 8
+    deadline = time.monotonic() + 8
     try:
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             readable, _, _ = select.select([master], [], [], 0.1)
             if readable:
-                chunk = os.read(master, 4096)
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError as exc:
+                    # Linux reports EIO when the PTY slave closes; macOS returns EOF.
+                    if exc.errno != errno.EIO:
+                        raise
+                    break
                 if not chunk:
                     break
                 output += chunk
                 if b"Reply: " in output and not sent:
-                    # abc, left, left, X, enter => aXbc only if cursor movement works.
-                    os.write(master, b"abc\x1b[D\x1b[DX\r")
+                    os.write(master, keystrokes)
                     sent = True
-            if proc.poll() is not None:
-                break
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGINT)
-            proc.wait(timeout=2)
+        proc.wait(timeout=2)
     finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
         os.close(master)
 
-    assert sent
-    assert proc.returncode == 0
-    assert b"RESULT:aXbc" in output
+    assert sent, output
+    assert proc.returncode == 0, output
+    assert f"RESULT:{expected_reply}".encode() in output.splitlines(), output
 
 
 def test_conversation_footer_shows_top_hotkeys_and_overlay_lists_all_keys(monkeypatch):
